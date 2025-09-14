@@ -750,3 +750,466 @@ class RequestRouter:
             "message": responses.get(intent, "I'm here to help with your banking needs."),
             "requires_action": False
         }
+
+
+
+
+
+# ai-services/orchestrator/clients/contact_sage_client.py
+"""
+Client for Contact-Sage service
+"""
+
+import requests
+import logging
+from typing import Dict, Any, Optional
+
+logger = logging.getLogger(__name__)
+
+class ContactSageClient:
+    """Client for interacting with Contact-Sage service"""
+    
+    def __init__(self, service_addr: str, timeout: int = 10):
+        self.service_addr = service_addr
+        self.timeout = timeout
+        self.base_url = f"http://{service_addr}"
+    
+    async def get_contacts(self, token: str, limit: Optional[int] = None) -> Dict[str, Any]:
+        """Get user contacts"""
+        try:
+            url = f"{self.base_url}/contacts"
+            headers = {"Authorization": f"Bearer {token}"}
+            params = {"limit": limit} if limit else {}
+            
+            response = requests.get(url, headers=headers, params=params, timeout=self.timeout)
+            
+            if response.status_code == 200:
+                return response.json()
+            else:
+                return {
+                    "status": "error",
+                    "error_message": f"Contact service error: {response.status_code}"
+                }
+                
+        except requests.exceptions.Timeout:
+            return {"status": "error", "error_message": "Contact service timeout"}
+        except Exception as e:
+            logger.error(f"Contact service error: {e}")
+            return {"status": "error", "error_message": "Contact service unavailable"}
+    
+    async def get_contact_details(self, token: str, contact_name: str) -> Dict[str, Any]:
+        """Get details for specific contact"""
+        try:
+            url = f"{self.base_url}/contacts/{contact_name}"
+            headers = {"Authorization": f"Bearer {token}"}
+            
+            response = requests.get(url, headers=headers, timeout=self.timeout)
+            
+            if response.status_code == 200:
+                return response.json()
+            else:
+                return {
+                    "status": "error",
+                    "error_message": f"Contact not found: {contact_name}"
+                }
+                
+        except Exception as e:
+            logger.error(f"Contact details error: {e}")
+            return {"status": "error", "error_message": "Unable to get contact details"}
+    
+    async def resolve_contact(self, token: str, recipient: str) -> Dict[str, Any]:
+        """Resolve contact name to account ID"""
+        try:
+            url = f"{self.base_url}/contacts/resolve"
+            headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+            payload = {"recipient": recipient}
+            
+            response = requests.post(url, headers=headers, json=payload, timeout=self.timeout)
+            
+            if response.status_code == 200:
+                return response.json()
+            else:
+                return {
+                    "status": "error",
+                    "error_message": f"Could not resolve recipient: {recipient}"
+                }
+                
+        except Exception as e:
+            logger.error(f"Contact resolution error: {e}")
+            return {"status": "error", "error_message": "Contact resolution failed"}
+
+# ai-services/orchestrator/clients/transaction_sage_client.py
+"""
+Client for Transaction-Sage service
+"""
+
+import requests
+import logging
+from typing import Dict, Any
+
+logger = logging.getLogger(__name__)
+
+class TransactionSageClient:
+    """Client for interacting with Transaction-Sage service"""
+    
+    def __init__(self, service_addr: str, timeout: int = 10):
+        self.service_addr = service_addr
+        self.timeout = timeout
+        self.base_url = f"http://{service_addr}"
+    
+    async def execute_transfer(self, token: str, amount: str, recipient_account: str, 
+                             parameters: Dict[str, Any]) -> Dict[str, Any]:
+        """Execute money transfer"""
+        try:
+            url = f"{self.base_url}/transfer"
+            headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+            
+            payload = {
+                "amount": amount,
+                "recipient_account": recipient_account,
+                "original_currency": parameters.get("original_currency"),
+                "original_amount": parameters.get("original_amount"),
+                "metadata": {
+                    "source": "orchestrator",
+                    "user_query": parameters.get("user_query", "")
+                }
+            }
+            
+            response = requests.post(url, headers=headers, json=payload, timeout=self.timeout)
+            
+            if response.status_code == 200:
+                return response.json()
+            else:
+                error_msg = response.json().get("error_message", "Transfer failed") if response.headers.get("content-type", "").startswith("application/json") else "Transfer service error"
+                return {
+                    "status": "error",
+                    "error_message": error_msg
+                }
+                
+        except requests.exceptions.Timeout:
+            return {"status": "error", "error_message": "Transfer service timeout"}
+        except Exception as e:
+            logger.error(f"Transfer execution error: {e}")
+            return {"status": "error", "error_message": "Unable to complete transfer"}
+    
+    async def execute_deposit(self, token: str, amount: str, parameters: Dict[str, Any]) -> Dict[str, Any]:
+        """Execute money deposit"""
+        try:
+            url = f"{self.base_url}/deposit"
+            headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+            
+            payload = {
+                "amount": amount,
+                "original_currency": parameters.get("original_currency"),
+                "original_amount": parameters.get("original_amount"),
+                "metadata": {
+                    "source": "orchestrator"
+                }
+            }
+            
+            response = requests.post(url, headers=headers, json=payload, timeout=self.timeout)
+            
+            if response.status_code == 200:
+                return response.json()
+            else:
+                error_msg = response.json().get("error_message", "Deposit failed") if response.headers.get("content-type", "").startswith("application/json") else "Deposit service error"
+                return {
+                    "status": "error", 
+                    "error_message": error_msg
+                }
+                
+        except Exception as e:
+            logger.error(f"Deposit execution error: {e}")
+            return {"status": "error", "error_message": "Unable to complete deposit"}
+
+# ai-services/orchestrator/clients/money_sage_client.py
+"""
+Client for Money-Sage service
+"""
+
+import requests
+import logging
+from typing import Dict, Any, Optional
+
+logger = logging.getLogger(__name__)
+
+class MoneySageClient:
+    """Client for interacting with Money-Sage service"""
+    
+    def __init__(self, service_addr: str, timeout: int = 10):
+        self.service_addr = service_addr
+        self.timeout = timeout
+        self.base_url = f"http://{service_addr}"
+    
+    async def get_balance(self, token: str, to_currency: Optional[str] = None) -> Dict[str, Any]:
+        """Get account balance with optional currency conversion"""
+        try:
+            url = f"{self.base_url}/balance"
+            headers = {"Authorization": f"Bearer {token}"}
+            params = {"to_currency": to_currency} if to_currency else {}
+            
+            response = requests.get(url, headers=headers, params=params, timeout=self.timeout)
+            
+            if response.status_code == 200:
+                return response.json()
+            else:
+                return {
+                    "status": "error",
+                    "error_message": "Unable to retrieve balance"
+                }
+                
+        except Exception as e:
+            logger.error(f"Balance retrieval error: {e}")
+            return {"status": "error", "error_message": "Balance service unavailable"}
+    
+    async def get_transaction_history(self, token: str, limit: int = 10, 
+                                    time_period: str = "recent") -> Dict[str, Any]:
+        """Get enriched transaction history"""
+        try:
+            url = f"{self.base_url}/transactions"
+            headers = {"Authorization": f"Bearer {token}"}
+            params = {"limit": limit, "time_period": time_period}
+            
+            response = requests.get(url, headers=headers, params=params, timeout=self.timeout)
+            
+            if response.status_code == 200:
+                return response.json()
+            else:
+                return {
+                    "status": "error",
+                    "error_message": "Unable to retrieve transactions"
+                }
+                
+        except Exception as e:
+            logger.error(f"Transaction history error: {e}")
+            return {"status": "error", "error_message": "Transaction service unavailable"}
+    
+    async def convert_currency(self, amount: str, from_currency: str, to_currency: str) -> Dict[str, Any]:
+        """Convert currency"""
+        try:
+            url = f"{self.base_url}/convert"
+            headers = {"Content-Type": "application/json"}
+            payload = {
+                "amount": amount,
+                "from_currency": from_currency,
+                "to_currency": to_currency
+            }
+            
+            response = requests.post(url, headers=headers, json=payload, timeout=self.timeout)
+            
+            if response.status_code == 200:
+                return response.json()
+            else:
+                return {
+                    "status": "error",
+                    "error_message": "Currency conversion failed"
+                }
+                
+        except Exception as e:
+            logger.error(f"Currency conversion error: {e}")
+            return {"status": "error", "error_message": "Conversion service unavailable"}
+    
+    async def get_spending_summary(self, token: str, period: str = "monthly") -> Dict[str, Any]:
+        """Get spending summary and insights"""
+        try:
+            url = f"{self.base_url}/spending-summary"
+            headers = {"Authorization": f"Bearer {token}"}
+            params = {"period": period}
+            
+            response = requests.get(url, headers=headers, params=params, timeout=self.timeout)
+            
+            if response.status_code == 200:
+                return response.json()
+            else:
+                return {
+                    "status": "error",
+                    "error_message": "Unable to retrieve spending summary"
+                }
+                
+        except Exception as e:
+            logger.error(f"Spending summary error: {e}")
+            return {"status": "error", "error_message": "Spending analysis unavailable"}
+
+# ai-services/orchestrator/clients/anomaly_sage_client.py
+"""
+Client for Anomaly-Sage service
+"""
+
+import requests
+import logging
+from typing import Dict, Any
+
+logger = logging.getLogger(__name__)
+
+class AnomalySageClient:
+    """Client for interacting with Anomaly-Sage service"""
+    
+    def __init__(self, service_addr: str, timeout: int = 10):
+        self.service_addr = service_addr
+        self.timeout = timeout
+        self.base_url = f"http://{service_addr}"
+    
+    async def check_transaction_risk(self, token: str, amount: str, recipient: str) -> Dict[str, Any]:
+        """Check transaction for anomalies and risk"""
+        try:
+            url = f"{self.base_url}/check-risk"
+            headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+            
+            payload = {
+                "amount": amount,
+                "recipient": recipient,
+                "timestamp": None,  # Will be set by service
+                "metadata": {
+                    "source": "orchestrator"
+                }
+            }
+            
+            response = requests.post(url, headers=headers, json=payload, timeout=self.timeout)
+            
+            if response.status_code == 200:
+                return response.json()
+            else:
+                # If anomaly service is down, allow transaction but log
+                logger.warning(f"Anomaly service unavailable: {response.status_code}")
+                return {
+                    "status": "normal",
+                    "risk_score": 0.0,
+                    "message": "Anomaly detection unavailable - transaction allowed"
+                }
+                
+        except Exception as e:
+            logger.error(f"Anomaly check error: {e}")
+            # Fail safe - allow transaction if anomaly service is down
+            return {
+                "status": "normal",
+                "risk_score": 0.0,
+                "message": "Anomaly detection unavailable - transaction allowed"
+            }
+    
+    async def confirm_suspicious_transaction(self, token: str, transaction_id: str, 
+                                           confirmation_code: str) -> Dict[str, Any]:
+        """Confirm a suspicious transaction via email/SMS code"""
+        try:
+            url = f"{self.base_url}/confirm-transaction"
+            headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+            
+            payload = {
+                "transaction_id": transaction_id,
+                "confirmation_code": confirmation_code
+            }
+            
+            response = requests.post(url, headers=headers, json=payload, timeout=self.timeout)
+            
+            if response.status_code == 200:
+                return response.json()
+            else:
+                return {
+                    "status": "error",
+                    "error_message": "Transaction confirmation failed"
+                }
+                
+        except Exception as e:
+            logger.error(f"Transaction confirmation error: {e}")
+            return {"status": "error", "error_message": "Confirmation service unavailable"}
+
+# ai-services/orchestrator/schemas/intent.py
+"""
+Intent classification schemas
+"""
+
+from pydantic import BaseModel, Field
+from typing import Dict, Any, Optional, List
+
+class IntentRequest(BaseModel):
+    """Request for intent classification"""
+    query: str = Field(..., description="User query to classify")
+    session_id: Optional[str] = Field(None, description="Session ID for context")
+    context: Optional[Dict[str, Any]] = Field(default_factory=dict, description="Additional context")
+
+class IntentResponse(BaseModel):
+    """Response from intent classification"""
+    intent: str = Field(..., description="Classified intent")
+    parameters: Dict[str, Any] = Field(default_factory=dict, description="Extracted parameters")
+    confidence: float = Field(..., description="Classification confidence score")
+    clarification_needed: bool = Field(False, description="Whether clarification is needed")
+    clarification_question: Optional[str] = Field(None, description="Question to ask user for clarification")
+
+# ai-services/orchestrator/schemas/transaction_request.py
+"""
+Transaction request schemas
+"""
+
+from pydantic import BaseModel, Field
+from typing import Optional, Dict, Any
+from decimal import Decimal
+
+class TransferRequest(BaseModel):
+    """Money transfer request"""
+    amount: str = Field(..., description="Amount to transfer")
+    recipient: str = Field(..., description="Recipient contact name or account number")
+    original_currency: Optional[str] = Field(None, description="Original currency if converted")
+    original_amount: Optional[float] = Field(None, description="Original amount before conversion")
+    note: Optional[str] = Field(None, description="Optional transfer note")
+
+class DepositRequest(BaseModel):
+    """Money deposit request"""
+    amount: str = Field(..., description="Amount to deposit")
+    original_currency: Optional[str] = Field(None, description="Original currency if converted")
+    original_amount: Optional[float] = Field(None, description="Original amount before conversion")
+    source_account: Optional[str] = Field(None, description="External source account")
+
+class TransactionResponse(BaseModel):
+    """Transaction response"""
+    status: str = Field(..., description="Transaction status")
+    transaction_id: Optional[str] = Field(None, description="Transaction ID")
+    new_balance: Optional[str] = Field(None, description="Updated account balance")
+    message: Optional[str] = Field(None, description="Success or error message")
+    error_message: Optional[str] = Field(None, description="Error details if failed")
+
+# ai-services/orchestrator/schemas/anomaly_score_request.py
+"""
+Anomaly scoring request schemas
+"""
+
+from pydantic import BaseModel, Field
+from typing import Optional, Dict, Any
+from datetime import datetime
+
+class AnomalyScoreRequest(BaseModel):
+    """Request for anomaly scoring"""
+    account_id: str = Field(..., description="Account performing transaction")
+    amount_cents: int = Field(..., description="Transaction amount in cents")
+    recipient: str = Field(..., description="Transaction recipient")
+    transaction_type: str = Field("transfer", description="Type of transaction")
+    timestamp: Optional[datetime] = Field(None, description="Transaction timestamp")
+    metadata: Dict[str, Any] = Field(default_factory=dict, description="Additional metadata")
+
+class AnomalyScoreResponse(BaseModel):
+    """Response from anomaly scoring"""
+    status: str = Field(..., description="Risk status: normal, suspicious, fraud")
+    risk_score: float = Field(..., description="Numerical risk score")
+    reasons: list[str] = Field(default_factory=list, description="Reasons for risk assessment")
+    action: str = Field(..., description="Recommended action: allow, confirm, block")
+    message: Optional[str] = Field(None, description="User-facing message")
+
+# ai-services/orchestrator/schemas/contact_resolution_request.py
+"""
+Contact resolution request schemas
+"""
+
+from pydantic import BaseModel, Field
+from typing import Optional, List
+
+class ContactResolutionRequest(BaseModel):
+    """Request to resolve contact name to account"""
+    recipient: str = Field(..., description="Contact name or account number to resolve")
+    fuzzy_match: bool = Field(True, description="Allow fuzzy matching of contact names")
+
+class ContactResolutionResponse(BaseModel):
+    """Response from contact resolution"""
+    status: str = Field(..., description="Resolution status")
+    account_id: Optional[str] = Field(None, description="Resolved account ID")
+    contact_name: Optional[str] = Field(None, description="Matched contact name")
+    confidence: Optional[float] = Field(None, description="Match confidence score")
+    suggestions: List[str] = Field(default_factory=list, description="Alternative suggestions")
+    error_message: Optional[str] = Field(None, description="Error details if failed")
