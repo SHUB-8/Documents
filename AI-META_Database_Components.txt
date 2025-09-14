@@ -1,0 +1,504 @@
+# ai-services/ai-meta-db/config.py
+"""
+Configuration for AI-Meta database
+"""
+
+import os
+from typing import Optional
+
+class DatabaseConfig:
+    """Database configuration"""
+    
+    def __init__(self):
+        self.host = os.getenv('AI_META_DB_HOST', 'localhost')
+        self.port = int(os.getenv('AI_META_DB_PORT', '5432'))
+        self.database = os.getenv('AI_META_DB_NAME', 'ai_meta')
+        self.username = os.getenv('AI_META_DB_USER', 'postgres')
+        self.password = os.getenv('AI_META_DB_PASSWORD', 'password')
+        
+    @property
+    def database_url(self) -> str:
+        return f"postgresql://{self.username}:{self.password}@{self.host}:{self.port}/{self.database}"
+    
+    @property
+    def async_database_url(self) -> str:
+        return f"postgresql+asyncpg://{self.username}:{self.password}@{self.host}:{self.port}/{self.database}"
+
+# ai-services/ai-meta-db/models/base.py
+"""
+Base model for AI-Meta database
+"""
+
+from sqlalchemy import create_engine
+from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.orm import sessionmaker
+from .config import DatabaseConfig
+
+config = DatabaseConfig()
+
+engine = create_engine(config.database_url)
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+Base = declarative_base()
+
+def get_db():
+    """Get database session"""
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
+# ai-services/ai-meta-db/models/merchant.py
+"""
+Merchant model for AI-Meta database
+"""
+
+import uuid
+from datetime import datetime
+from sqlalchemy import Column, String, DateTime, BigInteger, ARRAY, Text
+from sqlalchemy.dialects.postgresql import UUID
+from .base import Base
+
+class Merchant(Base):
+    """Merchant entity for transaction normalization"""
+    
+    __tablename__ = "merchants"
+    
+    merchant_id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    normalized_name = Column(Text, nullable=False, unique=True)
+    aliases = Column(ARRAY(Text), default=[])
+    category = Column(String(64))
+    first_seen = Column(DateTime, default=datetime.utcnow)
+    last_seen = Column(DateTime, default=datetime.utcnow)
+    frequency = Column(BigInteger, default=0)
+    
+    def __repr__(self):
+        return f"<Merchant(id={self.merchant_id}, name='{self.normalized_name}', category='{self.category}')>"
+
+# ai-services/ai-meta-db/models/annotation.py
+"""
+Transaction annotation model
+"""
+
+import uuid
+from datetime import datetime
+from sqlalchemy import Column, String, DateTime, BigInteger, Text, ForeignKey
+from sqlalchemy.dialects.postgresql import UUID
+from sqlalchemy.orm import relationship
+from .base import Base
+
+class TransactionAnnotation(Base):
+    """Transaction annotations for categorization and merchant info"""
+    
+    __tablename__ = "transaction_annotations"
+    
+    annotation_id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    transaction_id = Column(BigInteger, nullable=False)
+    account_id = Column(String(10), nullable=False)
+    merchant_id = Column(UUID(as_uuid=True), ForeignKey('merchants.merchant_id'))
+    merchant_name = Column(String(256))
+    category = Column(String(64))
+    user_note = Column(Text)
+    annotated_at = Column(DateTime, default=datetime.utcnow)
+    
+    # Relationship
+    merchant = relationship("Merchant", back_populates="annotations")
+    
+    def __repr__(self):
+        return f"<TransactionAnnotation(id={self.annotation_id}, txn_id={self.transaction_id}, category='{self.category}')>"
+
+# ai-services/ai-meta-db/models/anomaly_log.py
+"""
+Anomaly log model
+"""
+
+import uuid
+from datetime import datetime
+from sqlalchemy import Column, String, DateTime, BigInteger, Boolean, ARRAY, Text, DECIMAL
+from sqlalchemy.dialects.postgresql import UUID
+from .base import Base
+
+class AnomalyLog(Base):
+    """Anomaly detection logs"""
+    
+    __tablename__ = "anomaly_logs"
+    
+    log_id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    transaction_id = Column(BigInteger, nullable=False)
+    account_id = Column(String(10), nullable=False)
+    risk_score = Column(DECIMAL(6, 4), nullable=False)
+    status = Column(String(16), nullable=False)  # "normal", "suspicious", "fraud"
+    reasons = Column(ARRAY(Text), default=[])
+    alerted_at = Column(DateTime, default=datetime.utcnow)
+    resolved = Column(Boolean, default=False)
+    
+    def __repr__(self):
+        return f"<AnomalyLog(id={self.log_id}, account={self.account_id}, status='{self.status}', score={self.risk_score})>"
+
+# ai-services/ai-meta-db/models/budget.py
+"""
+Budget model
+"""
+
+import uuid
+from datetime import datetime, date
+from sqlalchemy import Column, String, DateTime, BigInteger, Date
+from sqlalchemy.dialects.postgresql import UUID
+from sqlalchemy.orm import relationship
+from .base import Base
+
+class Budget(Base):
+    """User budgets"""
+    
+    __tablename__ = "budgets"
+    
+    budget_id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    account_id = Column(String(10), nullable=False)
+    name = Column(String(128))
+    category = Column(String(64))
+    start_date = Column(Date, nullable=False)
+    end_date = Column(Date)  # NULL = ongoing
+    amount_cents = Column(BigInteger, nullable=False)
+    periodicity = Column(String(16), nullable=False)  # 'monthly', 'weekly', 'one_off'
+    created_at = Column(DateTime, default=datetime.utcnow)
+    
+    # Relationship
+    usage_records = relationship("BudgetUsage", back_populates="budget")
+    
+    def __repr__(self):
+        return f"<Budget(id={self.budget_id}, account={self.account_id}, name='{self.name}', amount=${self.amount_cents/100:.2f})>"
+
+class BudgetUsage(Base):
+    """Budget usage tracking"""
+    
+    __tablename__ = "budget_usage"
+    
+    usage_id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    budget_id = Column(UUID(as_uuid=True), ForeignKey('budgets.budget_id'), nullable=False)
+    period_start = Column(Date, nullable=False)
+    period_end = Column(Date, nullable=False)
+    spent_cents = Column(BigInteger, nullable=False)
+    last_updated = Column(DateTime, default=datetime.utcnow)
+    
+    # Relationship
+    budget = relationship("Budget", back_populates="usage_records")
+    
+    def __repr__(self):
+        return f"<BudgetUsage(id={self.usage_id}, budget_id={self.budget_id}, spent=${self.spent_cents/100:.2f})>"
+
+# ai-services/ai-meta-db/models/user_profile.py
+"""
+User profile model
+"""
+
+import uuid
+from datetime import datetime
+from sqlalchemy import Column, String, DateTime, ARRAY, Integer, DECIMAL, Text
+from sqlalchemy.dialects.postgresql import UUID
+from .base import Base
+
+class UserProfile(Base):
+    """User spending profiles for anomaly detection"""
+    
+    __tablename__ = "user_profiles"
+    
+    profile_id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    account_id = Column(String(10), nullable=False, unique=True)
+    mean_txn_amount_cents = Column(DECIMAL(14, 2))
+    stddev_txn_amount_cents = Column(DECIMAL(14, 2))
+    active_hours = Column(ARRAY(Integer), default=[8,9,10,11,12,13,14,15,16,17,18])
+    threshold_suspicious_multiplier = Column(DECIMAL(4, 2), default=3.0)
+    threshold_fraud_multiplier = Column(DECIMAL(4, 2), default=5.0)
+    email_for_alerts = Column(Text)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    
+    def __repr__(self):
+        return f"<UserProfile(account={self.account_id}, mean_txn=${self.mean_txn_amount_cents/100 if self.mean_txn_amount_cents else 0:.2f})>"
+
+# ai-services/ai-meta-db/models/__init__.py
+"""
+AI-Meta database models
+"""
+
+from .base import Base, get_db
+from .merchant import Merchant
+from .annotation import TransactionAnnotation
+from .anomaly_log import AnomalyLog
+from .budget import Budget, BudgetUsage
+from .user_profile import UserProfile
+
+__all__ = [
+    "Base",
+    "get_db", 
+    "Merchant",
+    "TransactionAnnotation",
+    "AnomalyLog", 
+    "Budget",
+    "BudgetUsage",
+    "UserProfile"
+]
+
+# ai-services/ai-meta-db/repository/ai_meta_repository.py
+"""
+Repository for AI-Meta database operations
+"""
+
+from typing import List, Optional, Dict, Any
+from sqlalchemy.orm import Session
+from sqlalchemy import func, desc
+from datetime import datetime, date
+import logging
+
+from ..models import (
+    Merchant, TransactionAnnotation, AnomalyLog, 
+    Budget, BudgetUsage, UserProfile
+)
+from ...shared.exceptions import ValidationError
+
+logger = logging.getLogger(__name__)
+
+class AIMetaRepository:
+    """Repository for AI-Meta database operations"""
+    
+    def __init__(self, db: Session):
+        self.db = db
+    
+    # Merchant operations
+    def get_or_create_merchant(self, normalized_name: str, category: str = None) -> Merchant:
+        """Get existing merchant or create new one"""
+        merchant = self.db.query(Merchant).filter(
+            Merchant.normalized_name == normalized_name
+        ).first()
+        
+        if not merchant:
+            merchant = Merchant(
+                normalized_name=normalized_name,
+                category=category,
+                frequency=1
+            )
+            self.db.add(merchant)
+            self.db.commit()
+            self.db.refresh(merchant)
+        else:
+            merchant.frequency += 1
+            merchant.last_seen = datetime.utcnow()
+            self.db.commit()
+        
+        return merchant
+    
+    def search_merchants(self, query: str, limit: int = 10) -> List[Merchant]:
+        """Search merchants by name or aliases"""
+        return self.db.query(Merchant).filter(
+            func.lower(Merchant.normalized_name).contains(query.lower())
+        ).limit(limit).all()
+    
+    # Transaction annotation operations
+    def create_transaction_annotation(self, transaction_id: int, account_id: str, 
+                                    merchant_name: str = None, category: str = None,
+                                    user_note: str = None) -> TransactionAnnotation:
+        """Create transaction annotation"""
+        annotation = TransactionAnnotation(
+            transaction_id=transaction_id,
+            account_id=account_id,
+            merchant_name=merchant_name,
+            category=category,
+            user_note=user_note
+        )
+        self.db.add(annotation)
+        self.db.commit()
+        self.db.refresh(annotation)
+        return annotation
+    
+    def get_transaction_annotations(self, account_id: str, limit: int = 100) -> List[TransactionAnnotation]:
+        """Get transaction annotations for account"""
+        return self.db.query(TransactionAnnotation).filter(
+            TransactionAnnotation.account_id == account_id
+        ).order_by(desc(TransactionAnnotation.annotated_at)).limit(limit).all()
+    
+    # Anomaly log operations
+    def create_anomaly_log(self, transaction_id: int, account_id: str, 
+                          risk_score: float, status: str, reasons: List[str]) -> AnomalyLog:
+        """Create anomaly detection log"""
+        log = AnomalyLog(
+            transaction_id=transaction_id,
+            account_id=account_id,
+            risk_score=risk_score,
+            status=status,
+            reasons=reasons
+        )
+        self.db.add(log)
+        self.db.commit()
+        self.db.refresh(log)
+        return log
+    
+    def get_anomaly_logs(self, account_id: str, limit: int = 50) -> List[AnomalyLog]:
+        """Get anomaly logs for account"""
+        return self.db.query(AnomalyLog).filter(
+            AnomalyLog.account_id == account_id
+        ).order_by(desc(AnomalyLog.alerted_at)).limit(limit).all()
+    
+    # Budget operations
+    def create_budget(self, account_id: str, name: str, amount_cents: int,
+                     periodicity: str, category: str = None, 
+                     start_date: date = None, end_date: date = None) -> Budget:
+        """Create budget"""
+        if not start_date:
+            start_date = date.today()
+            
+        budget = Budget(
+            account_id=account_id,
+            name=name,
+            category=category,
+            start_date=start_date,
+            end_date=end_date,
+            amount_cents=amount_cents,
+            periodicity=periodicity
+        )
+        self.db.add(budget)
+        self.db.commit()
+        self.db.refresh(budget)
+        return budget
+    
+    def get_budgets(self, account_id: str) -> List[Budget]:
+        """Get all budgets for account"""
+        return self.db.query(Budget).filter(
+            Budget.account_id == account_id
+        ).order_by(desc(Budget.created_at)).all()
+    
+    def update_budget_usage(self, budget_id: str, period_start: date, 
+                           period_end: date, spent_cents: int) -> BudgetUsage:
+        """Update budget usage for period"""
+        usage = self.db.query(BudgetUsage).filter(
+            BudgetUsage.budget_id == budget_id,
+            BudgetUsage.period_start == period_start
+        ).first()
+        
+        if usage:
+            usage.spent_cents = spent_cents
+            usage.last_updated = datetime.utcnow()
+        else:
+            usage = BudgetUsage(
+                budget_id=budget_id,
+                period_start=period_start,
+                period_end=period_end,
+                spent_cents=spent_cents
+            )
+            self.db.add(usage)
+        
+        self.db.commit()
+        self.db.refresh(usage)
+        return usage
+    
+    # User profile operations
+    def get_or_create_user_profile(self, account_id: str) -> UserProfile:
+        """Get or create user profile"""
+        profile = self.db.query(UserProfile).filter(
+            UserProfile.account_id == account_id
+        ).first()
+        
+        if not profile:
+            profile = UserProfile(account_id=account_id)
+            self.db.add(profile)
+            self.db.commit()
+            self.db.refresh(profile)
+        
+        return profile
+    
+    def update_user_profile_stats(self, account_id: str, 
+                                 mean_txn_amount_cents: float,
+                                 stddev_txn_amount_cents: float) -> UserProfile:
+        """Update user profile transaction statistics"""
+        profile = self.get_or_create_user_profile(account_id)
+        profile.mean_txn_amount_cents = mean_txn_amount_cents
+        profile.stddev_txn_amount_cents = stddev_txn_amount_cents
+        
+        self.db.commit()
+        self.db.refresh(profile)
+        return profile
+
+# ai-services/ai-meta-db/migrations/0001_create_tables_ai_meta.sql
+-- Initial AI-Meta database schema
+
+CREATE EXTENSION IF NOT EXISTS pgcrypto;
+CREATE EXTENSION IF NOT EXISTS pg_trgm;
+
+-- Stores normalized merchants & aliases
+CREATE TABLE merchants (
+  merchant_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  normalized_name TEXT NOT NULL UNIQUE,
+  aliases TEXT[] DEFAULT ARRAY[]::text[],
+  category VARCHAR(64),
+  first_seen TIMESTAMPTZ DEFAULT now(),
+  last_seen TIMESTAMPTZ DEFAULT now(),
+  frequency BIGINT DEFAULT 0
+);
+
+-- Annotations per transaction for merchant, category, user note, etc.
+CREATE TABLE transaction_annotations (
+  annotation_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  transaction_id BIGINT NOT NULL,        -- matches ledger-db.transactions.transaction_id
+  account_id CHAR(10) NOT NULL,           -- matches accounts-db.accountid
+  merchant_id UUID NULL REFERENCES merchants(merchant_id),
+  merchant_name VARCHAR(256) NULL,
+  category VARCHAR(64) NULL,
+  user_note TEXT NULL,
+  annotated_at TIMESTAMPTZ DEFAULT now()
+);
+
+-- Alerts / logs for anomalies
+CREATE TABLE anomaly_logs (
+  log_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  transaction_id BIGINT NOT NULL,
+  account_id CHAR(10) NOT NULL,
+  risk_score NUMERIC(6,4) NOT NULL,
+  status VARCHAR(16) NOT NULL,          -- "normal", "suspicious", "fraud"
+  reasons TEXT[] DEFAULT ARRAY[]::text[],
+  alerted_at TIMESTAMPTZ DEFAULT now(),
+  resolved BOOLEAN DEFAULT FALSE
+);
+
+-- Budgets (per user, per category, period)
+CREATE TABLE budgets (
+  budget_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  account_id CHAR(10) NOT NULL,
+  name VARCHAR(128),
+  category VARCHAR(64) NULL,
+  start_date DATE NOT NULL,
+  end_date DATE NULL,                    -- null = ongoing
+  amount_cents BIGINT NOT NULL,
+  periodicity VARCHAR(16) NOT NULL,       -- e.g. 'monthly', 'weekly', 'one_off'
+  created_at TIMESTAMPTZ DEFAULT now()
+);
+
+-- User profile / preferences for anomaly thresholds and spending behaviour
+CREATE TABLE user_profiles (
+  profile_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  account_id CHAR(10) NOT NULL UNIQUE,
+  mean_txn_amount_cents NUMERIC(14,2) NULL,
+  stddev_txn_amount_cents NUMERIC(14,2) NULL,
+  active_hours INT[] DEFAULT ARRAY[8,9,10,11,12,13,14,15,16,17,18]::int[],
+  threshold_suspicious_multiplier NUMERIC(4,2) DEFAULT 3.0,
+  threshold_fraud_multiplier NUMERIC(4,2) DEFAULT 5.0,
+  email_for_alerts TEXT NULL,
+  created_at TIMESTAMPTZ DEFAULT now()
+);
+
+-- Track budget usage summary per period by user
+CREATE TABLE budget_usage (
+  usage_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  budget_id UUID NOT NULL REFERENCES budgets(budget_id),
+  period_start DATE NOT NULL,
+  period_end DATE NOT NULL,
+  spent_cents BIGINT NOT NULL,
+  last_updated TIMESTAMPTZ DEFAULT now()
+);
+
+-- Add indices
+CREATE INDEX idx_txn_annotations_txnid ON transaction_annotations (transaction_id);
+CREATE INDEX idx_txn_annotations_account ON transaction_annotations (account_id);
+CREATE INDEX idx_anomaly_logs_account ON anomaly_logs (account_id);
+CREATE INDEX idx_anomaly_logs_txnid ON anomaly_logs (transaction_id);
+CREATE INDEX idx_budgets_account ON budgets (account_id);
+CREATE INDEX idx_user_profiles_account ON user_profiles (account_id);
+CREATE INDEX idx_budget_usage_budget ON budget_usage (budget_id);
+CREATE INDEX idx_merchants_name ON merchants USING gin(normalized_name gin_trgm_ops);

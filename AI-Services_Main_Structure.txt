@@ -1,0 +1,194 @@
+# ai-services/requirements.txt
+fastapi==0.104.1
+uvicorn==0.24.0
+pydantic==2.5.0
+psycopg2-binary==2.9.9
+sqlalchemy==2.0.23
+alembic==1.13.1
+requests==2.31.0
+python-multipart==0.0.6
+python-jose[cryptography]==3.3.0
+passlib[bcrypt]==1.7.4
+asyncpg==0.29.0
+redis==5.0.1
+celery==5.3.4
+google-generativeai==0.3.2
+pytest==7.4.3
+pytest-asyncio==0.21.1
+
+# ai-services/shared/constants.py
+"""
+Shared constants for AI services
+"""
+
+# Core service default addresses
+CORE_SERVICES = {
+    'BALANCES_API_ADDR': 'balancereader:8080',
+    'CONTACTS_API_ADDR': 'contacts:8080', 
+    'TRANSACTIONS_API_ADDR': 'ledgerwriter:8080',
+    'HISTORY_API_ADDR': 'transactionhistory:8080',
+    'USERSERVICE_API_ADDR': 'userservice:8080',
+}
+
+# Currency conversion rates (fallback)
+CURRENCY_RATES = {
+    'eur': 1.09, 'euro': 1.09, 'euros': 1.09, '€': 1.09, 'euors': 1.09,
+    'gbp': 1.27, 'pound': 1.27, 'pounds': 1.27, '£': 1.27,
+    'jpy': 0.0068, 'yen': 0.0068, '¥': 0.0068,
+    'inr': 0.012, 'rupee': 0.012, 'rupees': 0.012, '₹': 0.012, 'ruppe': 0.012,
+    'cad': 0.74, 'canadian': 0.74,
+    'aud': 0.66, 'australian': 0.66,
+    'usd': 1.0, 'dollar': 1.0, 'dollars': 1.0, '$': 1.0
+}
+
+# Intent classifications
+BANKING_INTENTS = [
+    "check.balance",
+    "view.transactions", 
+    "transfer.money",
+    "deposit.money",
+    "list.contacts",
+    "contact.details",
+    "help.banking",
+    "greeting",
+    "convert.currency"
+]
+
+# Transaction limits
+MAX_TRANSFER_AMOUNT = 10000  # USD
+MAX_DEPOSIT_AMOUNT = 50000   # USD
+
+# Anomaly detection
+RISK_STATUSES = ["normal", "suspicious", "fraud"]
+DEFAULT_SUSPICIOUS_MULTIPLIER = 3.0
+DEFAULT_FRAUD_MULTIPLIER = 5.0
+
+# ai-services/shared/utils.py
+"""
+Shared utilities for AI services
+"""
+
+import re
+import logging
+import hashlib
+from typing import Optional, Tuple
+from datetime import datetime
+
+logger = logging.getLogger(__name__)
+
+def extract_amount_from_text(text: str) -> Tuple[Optional[float], Optional[str]]:
+    """
+    Extract amount and currency from text
+    Returns: (amount_in_usd, original_currency)
+    """
+    from .constants import CURRENCY_RATES
+    
+    patterns = [
+        r'(\d+(?:[,\s]\d{3})*(?:\.\d+)?)\s*(?:euros?|eur|€)',
+        r'(\d+(?:[,\s]\d{3})*(?:\.\d+)?)\s*(?:pounds?|gbp|£)',
+        r'(\d+(?:[,\s]\d{3})*(?:\.\d+)?)\s*(?:yen|jpy|¥)',
+        r'(\d+(?:[,\s]\d{3})*(?:\.\d+)?)\s*(?:rupees?|inr|₹|ruppe)',
+        r'(\d+(?:[,\s]\d{3})*(?:\.\d+)?)\s*(?:canadian|cad)',
+        r'(\d+(?:[,\s]\d{3})*(?:\.\d+)?)\s*(?:australian|aud)',
+        r'\$?\s*(\d+(?:[,\s]\d{3})*(?:\.\d+)?)\s*(?:dollars?|usd)?',
+        r'(\d+(?:[,\s]\d{3})*(?:\.\d+)?)'  # Plain number
+    ]
+    
+    for pattern in patterns:
+        match = re.search(pattern, text, re.IGNORECASE)
+        if match:
+            amount_str = match.group(1).replace(',', '').replace(' ', '')
+            try:
+                amount = float(amount_str)
+                text_lower = text.lower()
+                
+                # Determine currency and convert to USD
+                if any(curr in text_lower for curr in ['euro', 'eur', '€', 'euors']):
+                    return amount * CURRENCY_RATES['eur'], 'EUR'
+                elif any(curr in text_lower for curr in ['pound', 'gbp', '£']):
+                    return amount * CURRENCY_RATES['gbp'], 'GBP'
+                elif any(curr in text_lower for curr in ['yen', 'jpy', '¥']):
+                    return amount * CURRENCY_RATES['jpy'], 'JPY'
+                elif any(curr in text_lower for curr in ['rupee', 'inr', '₹', 'ruppe']):
+                    return amount * CURRENCY_RATES['inr'], 'INR'
+                elif 'canadian' in text_lower or 'cad' in text_lower:
+                    return amount * CURRENCY_RATES['cad'], 'CAD'
+                elif 'australian' in text_lower or 'aud' in text_lower:
+                    return amount * CURRENCY_RATES['aud'], 'AUD'
+                else:
+                    return amount, 'USD'
+            except ValueError:
+                continue
+    
+    return None, None
+
+def generate_transaction_id(prefix: str = "txn") -> str:
+    """Generate unique transaction ID"""
+    timestamp = datetime.now().isoformat()
+    unique_hash = hashlib.md5(f"{timestamp}{prefix}".encode()).hexdigest()[:8]
+    return f"{prefix}_{timestamp}_{unique_hash}"
+
+def validate_account_number(account_num: str) -> bool:
+    """Validate account number format"""
+    return bool(re.match(r'^\d{10}$', str(account_num)))
+
+def sanitize_contact_name(name: str) -> str:
+    """Sanitize contact name for lookups"""
+    return re.sub(r'[^\w\s]', '', name.strip()).lower()
+
+# ai-services/shared/exceptions.py
+"""
+Custom exceptions for AI services
+"""
+
+class AIServiceException(Exception):
+    """Base exception for AI services"""
+    pass
+
+class AuthenticationError(AIServiceException):
+    """Authentication failed"""
+    pass
+
+class ValidationError(AIServiceException):
+    """Input validation failed"""
+    pass
+
+class ServiceUnavailableError(AIServiceException):
+    """External service unavailable"""
+    pass
+
+class InsufficientFundsError(AIServiceException):
+    """Insufficient account balance"""
+    pass
+
+class ContactNotFoundError(AIServiceException):
+    """Contact not found"""
+    pass
+
+class AnomalyDetectedError(AIServiceException):
+    """Transaction blocked due to anomaly detection"""
+    pass
+
+# ai-services/shared/logging_utils.py
+"""
+Logging utilities for AI services
+"""
+
+import logging
+import sys
+from datetime import datetime
+
+def setup_logging(service_name: str, level: str = "INFO") -> logging.Logger:
+    """Setup logging for service"""
+    logger = logging.getLogger(service_name)
+    logger.setLevel(getattr(logging, level.upper()))
+    
+    if not logger.handlers:
+        handler = logging.StreamHandler(sys.stdout)
+        formatter = logging.Formatter(
+            f'%(asctime)s - {service_name} - %(levelname)s - %(message)s'
+        )
+        handler.setFormatter(formatter)
+        logger.addHandler(handler)
+    
+    return logger

@@ -1,0 +1,752 @@
+# ai-services/orchestrator/config.py
+"""
+Configuration for orchestrator service
+"""
+
+import os
+from typing import Dict
+
+class OrchestratorConfig:
+    """Configuration for orchestrator"""
+    
+    def __init__(self):
+        # Core service addresses
+        self.balance_addr = os.getenv('BALANCES_API_ADDR', 'balancereader:8080')
+        self.contacts_addr = os.getenv('CONTACTS_API_ADDR', 'contacts:8080')
+        self.transactions_addr = os.getenv('HISTORY_API_ADDR', 'transactionhistory:8080')
+        self.ledger_addr = os.getenv('TRANSACTIONS_API_ADDR', 'ledgerwriter:8080')
+        self.userservice_addr = os.getenv('USERSERVICE_API_ADDR', 'userservice:8080')
+        
+        # AI service addresses
+        self.contact_sage_addr = os.getenv('CONTACT_SAGE_ADDR', 'contact-sage:8080')
+        self.transaction_sage_addr = os.getenv('TRANSACTION_SAGE_ADDR', 'transaction-sage:8080')
+        self.money_sage_addr = os.getenv('MONEY_SAGE_ADDR', 'money-sage:8080')
+        self.anomaly_sage_addr = os.getenv('ANOMALY_SAGE_ADDR', 'anomaly-sage:8080')
+        
+        # Authentication
+        self.jwt_public_key = self._load_public_key()
+        self.local_routing_num = os.getenv('LOCAL_ROUTING_NUM', '883745000')
+        
+        # LLM configuration
+        self.gemini_api_key = os.getenv('GEMINI_API_KEY')
+        self.enable_llm = bool(self.gemini_api_key)
+        
+        # Service settings
+        self.backend_timeout = int(os.getenv('BACKEND_TIMEOUT', '10'))
+        self.session_ttl = int(os.getenv('SESSION_TTL', '1800'))  # 30 minutes
+        
+    def _load_public_key(self) -> str:
+        """Load JWT public key"""
+        try:
+            public_key_path = "/tmp/.ssh/publickey"
+            if os.path.exists(public_key_path):
+                with open(public_key_path, 'r') as f:
+                    return f.read()
+            
+            import base64
+            public_key_b64 = os.getenv('JWT_PUBLIC_KEY')
+            if public_key_b64:
+                return base64.b64decode(public_key_b64).decode('utf-8')
+                
+            return None
+        except Exception as e:
+            print(f"Error loading public key: {e}")
+            return None
+
+# ai-services/orchestrator/session_store.py
+"""
+Session memory management for conversations
+"""
+
+import uuid
+import time
+from typing import Dict, Any, Optional, List
+from collections import deque
+from datetime import datetime
+import logging
+
+logger = logging.getLogger(__name__)
+
+class ConversationMemory:
+    """Manages conversation context and entity tracking"""
+    
+    def __init__(self, max_exchanges: int = 5):
+        self.exchanges = deque(maxlen=max_exchanges)
+        self.entities = {}
+        self.last_recipient = None
+        self.last_amount = None
+        self.session_start = datetime.now()
+        self.last_access = time.time()
+    
+    def add_exchange(self, query: str, intent: str, parameters: Dict, result: Dict = None):
+        """Add a conversation exchange to memory"""
+        exchange = {
+            "timestamp": datetime.now().isoformat(),
+            "query": query,
+            "intent": intent,
+            "parameters": parameters,
+            "result": result
+        }
+        self.exchanges.append(exchange)
+        self.last_access = time.time()
+        
+        # Track entities for reference resolution
+        if parameters.get("recipient"):
+            self.last_recipient = parameters["recipient"]
+        if parameters.get("amount"):
+            self.last_amount = parameters["amount"]
+    
+    def get_context_summary(self) -> str:
+        """Get a summary of recent conversation for LLM context"""
+        if not self.exchanges:
+            return "No previous conversation."
+        
+        summary = "Recent conversation:\n"
+        for exchange in list(self.exchanges)[-3:]:  # Last 3 exchanges
+            summary += f"- User: {exchange['query']}\n"
+            summary += f"  Intent: {exchange['intent']}, Parameters: {exchange['parameters']}\n"
+            if exchange.get('result') and exchange['result'].get('status') == 'success':
+                summary += f"  Result: Success\n"
+        
+        return summary
+    
+    def resolve_pronouns(self, text: str) -> str:
+        """Resolve pronouns and references using conversation context"""
+        import re
+        
+        # Replace pronouns with last entities
+        if self.last_recipient and any(pronoun in text.lower() for pronoun in ['them', 'him', 'her', 'that person']):
+            text = re.sub(r'\b(them|him|her|that person)\b', self.last_recipient, text, flags=re.IGNORECASE)
+        
+        if self.last_amount and 'same amount' in text.lower():
+            text = text.replace('same amount', self.last_amount)
+        
+        return text
+
+class SessionStore:
+    """In-memory session storage with TTL"""
+    
+    def __init__(self, default_ttl: int = 1800):
+        self.sessions: Dict[str, ConversationMemory] = {}
+        self.default_ttl = default_ttl
+        
+    def get_or_create_session(self, session_id: str = None) -> tuple[str, ConversationMemory]:
+        """Get existing session or create new one"""
+        if not session_id:
+            session_id = str(uuid.uuid4())
+        
+        # Clean up expired sessions
+        self._cleanup_expired_sessions()
+        
+        if session_id not in self.sessions:
+            self.sessions[session_id] = ConversationMemory()
+        
+        return session_id, self.sessions[session_id]
+    
+    def _cleanup_expired_sessions(self):
+        """Remove expired sessions"""
+        current_time = time.time()
+        expired_sessions = []
+        
+        for sid, memory in self.sessions.items():
+            if current_time - memory.last_access > self.default_ttl:
+                expired_sessions.append(sid)
+        
+        for sid in expired_sessions:
+            del self.sessions[sid]
+            logger.info(f"Cleaned up expired session: {sid}")
+
+# ai-services/orchestrator/preprocess.py
+"""
+Preprocessing utilities for user queries
+"""
+
+import re
+from typing import Tuple, Optional, Dict, Any
+from ..shared.utils import extract_amount_from_text
+from ..shared.constants import CURRENCY_RATES
+import logging
+
+logger = logging.getLogger(__name__)
+
+class QueryPreprocessor:
+    """Preprocesses user queries for better intent classification"""
+    
+    def __init__(self):
+        self.currency_rates = CURRENCY_RATES
+    
+    def preprocess_query(self, query: str, conversation_memory=None) -> Dict[str, Any]:
+        """
+        Preprocess user query to extract structured information
+        
+        Returns:
+            Dict with processed query, extracted amounts, currencies, etc.
+        """
+        result = {
+            "original_query": query,
+            "processed_query": query,
+            "extracted_amount": None,
+            "extracted_currency": None,
+            "original_amount": None,
+            "mentions_contact": False,
+            "mentions_account": False,
+            "context_resolved": False
+        }
+        
+        # Resolve pronouns if conversation memory is available
+        if conversation_memory:
+            processed_query = conversation_memory.resolve_pronouns(query)
+            if processed_query != query:
+                result["processed_query"] = processed_query
+                result["context_resolved"] = True
+        
+        # Extract amount and currency
+        amount_usd, currency = extract_amount_from_text(result["processed_query"])
+        if amount_usd:
+            result["extracted_amount"] = amount_usd
+            result["extracted_currency"] = currency
+            result["original_amount"] = self._get_original_amount(result["processed_query"], currency)
+        
+        # Check for contact mentions
+        if self._mentions_contact(result["processed_query"]):
+            result["mentions_contact"] = True
+        
+        # Check for account number mentions
+        if self._mentions_account_number(result["processed_query"]):
+            result["mentions_account"] = True
+        
+        # Clean and normalize query
+        result["processed_query"] = self._clean_query(result["processed_query"])
+        
+        logger.info(f"Preprocessed query: {result}")
+        return result
+    
+    def _get_original_amount(self, text: str, currency: str) -> Optional[float]:
+        """Extract the original amount in the specified currency"""
+        if not currency or currency == 'USD':
+            return None
+            
+        # Find the numeric value that was used for conversion
+        patterns = [
+            r'(\d+(?:[,\s]\d{3})*(?:\.\d+)?)',
+        ]
+        
+        for pattern in patterns:
+            matches = re.findall(pattern, text, re.IGNORECASE)
+            for match in matches:
+                try:
+                    amount_str = match.replace(',', '').replace(' ', '')
+                    return float(amount_str)
+                except ValueError:
+                    continue
+        return None
+    
+    def _mentions_contact(self, text: str) -> bool:
+        """Check if query mentions a contact name"""
+        contact_patterns = [
+            r'\bto\s+([a-zA-Z]+)\b',
+            r'\bfor\s+([a-zA-Z]+)\b',
+            r'\bsend\s+.*\s+to\s+([a-zA-Z]+)\b',
+            r'\btransfer\s+.*\s+to\s+([a-zA-Z]+)\b'
+        ]
+        
+        for pattern in contact_patterns:
+            if re.search(pattern, text, re.IGNORECASE):
+                return True
+        return False
+    
+    def _mentions_account_number(self, text: str) -> bool:
+        """Check if query mentions an account number"""
+        account_pattern = r'\b\d{10}\b'
+        return bool(re.search(account_pattern, text))
+    
+    def _clean_query(self, text: str) -> str:
+        """Clean and normalize query text"""
+        # Remove extra whitespace
+        text = re.sub(r'\s+', ' ', text).strip()
+        
+        # Fix common typos
+        typos = {
+            'transactiion': 'transaction',
+            'transferr': 'transfer',
+            'ballance': 'balance',
+            'ruppe': 'rupee'
+        }
+        
+        for typo, correction in typos.items():
+            text = re.sub(rf'\b{typo}\b', correction, text, flags=re.IGNORECASE)
+        
+        return text
+
+# ai-services/orchestrator/intent_classifier.py
+"""
+Intent classification using LLM and fallback patterns
+"""
+
+import json
+import re
+import requests
+import logging
+from typing import Dict, Any, Optional
+from ..shared.constants import BANKING_INTENTS
+from .preprocess import QueryPreprocessor
+
+logger = logging.getLogger(__name__)
+
+class IntentClassifier:
+    """Enhanced intent classifier with LLM and fallback logic"""
+    
+    def __init__(self, gemini_api_key: str = None):
+        self.gemini_api_key = gemini_api_key
+        self.enabled = bool(gemini_api_key)
+        self.preprocessor = QueryPreprocessor()
+        
+        if self.enabled:
+            logger.info("LLM-powered intent classification enabled")
+        else:
+            logger.info("Using fallback pattern-based intent classification")
+    
+    async def classify_intent(self, query: str, conversation_memory=None) -> Dict[str, Any]:
+        """
+        Classify user intent and extract parameters
+        
+        Returns structured intent data with parameters
+        """
+        # Preprocess query
+        preprocessing_result = self.preprocessor.preprocess_query(query, conversation_memory)
+        processed_query = preprocessing_result["processed_query"]
+        
+        # Try LLM classification first
+        if self.enabled:
+            llm_result = await self._llm_classify(processed_query, conversation_memory)
+            if llm_result:
+                # Merge preprocessing results with LLM results
+                return self._merge_results(llm_result, preprocessing_result)
+        
+        # Fallback to pattern-based classification
+        pattern_result = self._pattern_classify(processed_query)
+        return self._merge_results(pattern_result, preprocessing_result)
+    
+    async def _llm_classify(self, query: str, conversation_memory=None) -> Optional[Dict[str, Any]]:
+        """Classify using LLM (Gemini)"""
+        try:
+            context = ""
+            if conversation_memory:
+                context = conversation_memory.get_context_summary()
+            
+            prompt = self._build_classification_prompt(query, context)
+            response_text = await self._call_gemini_api(prompt)
+            
+            if response_text:
+                return self._parse_llm_response(response_text)
+                
+        except Exception as e:
+            logger.error(f"LLM classification error: {e}")
+        
+        return None
+    
+    def _build_classification_prompt(self, query: str, context: str = "") -> str:
+        """Build prompt for LLM intent classification"""
+        
+        prompt = '''You are an expert banking assistant AI for Bank of Anthos. Extract intent and parameters from the user query.
+
+AVAILABLE BANKING OPERATIONS:
+1. check.balance - Check account balance
+2. view.transactions - View transaction history  
+3. transfer.money - Transfer money to contacts or accounts
+4. deposit.money - Deposit money to account
+5. list.contacts - Show available contacts
+6. contact.details - Get details for a specific contact
+7. help.banking - General banking help
+8. greeting - Welcome/greeting messages
+9. convert.currency - Convert currencies
+
+RESPONSE FORMAT (Return ONLY valid JSON, no other text):
+{
+    "intent": "operation_name",
+    "parameters": {
+        "amount": "123.45",
+        "recipient": "Alice",
+        "limit": "5",
+        "contact_name": "Bob",
+        "to_currency": "EUR",
+        "from_currency": "USD"
+    },
+    "confidence": 0.9
+}
+
+EXAMPLES:
+
+User: "What's my balance?"
+Response: {"intent": "check.balance", "parameters": {}, "confidence": 0.95}
+
+User: "transfer 100 to Alice"
+Response: {"intent": "transfer.money", "parameters": {"amount": "100.00", "recipient": "Alice"}, "confidence": 0.9}
+
+User: "show my last 5 transactions"
+Response: {"intent": "view.transactions", "parameters": {"limit": "5", "time_period": "recent"}, "confidence": 0.9}
+
+'''
+        
+        if context:
+            prompt += f"\nConversation Context:\n{context}\n"
+        
+        prompt += f"\nUser Query: {query}\n\nResponse:"
+        return prompt
+    
+    async def _call_gemini_api(self, prompt: str) -> Optional[str]:
+        """Call Gemini API via HTTP"""
+        try:
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-pro:generateContent?key={self.gemini_api_key}"
+            
+            payload = {
+                "contents": [{
+                    "parts": [{"text": prompt}]
+                }],
+                "generationConfig": {
+                    "temperature": 0.2,
+                    "topP": 0.8,
+                    "topK": 40,
+                    "maxOutputTokens": 1024,
+                }
+            }
+            
+            response = requests.post(url, json=payload, timeout=10)
+            
+            if response.status_code == 200:
+                data = response.json()
+                if "candidates" in data and len(data["candidates"]) > 0:
+                    return data["candidates"][0]["content"]["parts"][0]["text"]
+                    
+        except Exception as e:
+            logger.error(f"Gemini API error: {e}")
+        
+        return None
+    
+    def _parse_llm_response(self, response_text: str) -> Optional[Dict[str, Any]]:
+        """Parse LLM response into structured format"""
+        try:
+            # Clean response text
+            response_text = response_text.strip()
+            if response_text.startswith('```json'):
+                response_text = response_text[7:]
+            if response_text.startswith('```'):
+                response_text = response_text[3:]
+            if response_text.endswith('```'):
+                response_text = response_text[:-3]
+            response_text = response_text.strip()
+            
+            # Parse JSON
+            parsed = json.loads(response_text)
+            
+            # Validate intent
+            if parsed.get("intent") not in BANKING_INTENTS:
+                logger.warning(f"Invalid intent from LLM: {parsed.get('intent')}")
+                return None
+            
+            return parsed
+            
+        except json.JSONDecodeError as e:
+            logger.error(f"JSON parse error: {e}")
+            return None
+    
+    def _pattern_classify(self, query: str) -> Dict[str, Any]:
+        """Fallback pattern-based intent classification"""
+        query_lower = query.lower()
+        
+        # Balance check patterns
+        if any(word in query_lower for word in ['balance', 'how much', 'money in']):
+            return {
+                "intent": "check.balance",
+                "parameters": {},
+                "confidence": 0.8
+            }
+        
+        # Transfer patterns
+        elif any(word in query_lower for word in ['transfer', 'send', 'pay']):
+            params = {}
+            
+            # Extract recipient
+            recipient_match = re.search(r'\b(?:to|for)\s+([a-zA-Z0-9]+)', query, re.IGNORECASE)
+            if recipient_match:
+                params["recipient"] = recipient_match.group(1)
+            
+            return {
+                "intent": "transfer.money",
+                "parameters": params,
+                "confidence": 0.7
+            }
+        
+        # Transaction history patterns
+        elif any(word in query_lower for word in ['transaction', 'history', 'statement']):
+            params = {"time_period": "recent"}
+            
+            # Extract limit
+            limit_match = re.search(r'\b(\d+)\s+(?:transactions?|transfers?)', query_lower)
+            if limit_match:
+                params["limit"] = limit_match.group(1)
+            else:
+                params["limit"] = "10"
+            
+            return {
+                "intent": "view.transactions", 
+                "parameters": params,
+                "confidence": 0.7
+            }
+        
+        # Deposit patterns
+        elif any(word in query_lower for word in ['deposit', 'add money', 'put money']):
+            return {
+                "intent": "deposit.money",
+                "parameters": {},
+                "confidence": 0.7
+            }
+        
+        # Contact patterns
+        elif any(word in query_lower for word in ['contact', 'recipient', 'who can']):
+            return {
+                "intent": "list.contacts",
+                "parameters": {},
+                "confidence": 0.7
+            }
+        
+        # Greeting patterns
+        elif any(word in query_lower for word in ['hello', 'hi', 'hey', 'good morning']):
+            return {
+                "intent": "greeting",
+                "parameters": {},
+                "confidence": 0.9
+            }
+        
+        # Currency conversion patterns
+        elif any(word in query_lower for word in ['convert', 'exchange', 'change']) and any(curr in query_lower for curr in ['euro', 'dollar', 'pound']):
+            return {
+                "intent": "convert.currency",
+                "parameters": {},
+                "confidence": 0.6
+            }
+        
+        # Default to help
+        else:
+            return {
+                "intent": "help.banking",
+                "parameters": {},
+                "confidence": 0.5
+            }
+    
+    def _merge_results(self, intent_result: Dict[str, Any], preprocessing_result: Dict[str, Any]) -> Dict[str, Any]:
+        """Merge intent classification with preprocessing results"""
+        merged = intent_result.copy()
+        
+        # Add extracted amounts if not present
+        if "amount" not in merged.get("parameters", {}) and preprocessing_result.get("extracted_amount"):
+            merged.setdefault("parameters", {})["amount"] = f"{preprocessing_result['extracted_amount']:.2f}"
+        
+        # Add currency information
+        if preprocessing_result.get("extracted_currency") and preprocessing_result.get("original_amount"):
+            merged.setdefault("parameters", {}).update({
+                "original_currency": preprocessing_result["extracted_currency"],
+                "original_amount": preprocessing_result["original_amount"]
+            })
+        
+        # Add preprocessing metadata
+        merged["preprocessing"] = {
+            "context_resolved": preprocessing_result.get("context_resolved", False),
+            "mentions_contact": preprocessing_result.get("mentions_contact", False),
+            "mentions_account": preprocessing_result.get("mentions_account", False)
+        }
+        
+        return merged
+
+# ai-services/orchestrator/router.py
+"""
+Request router for orchestrator - routes to appropriate AI agents
+"""
+
+import logging
+from typing import Dict, Any, Optional
+from .clients.contact_sage_client import ContactSageClient
+from .clients.transaction_sage_client import TransactionSageClient  
+from .clients.money_sage_client import MoneySageClient
+from .clients.anomaly_sage_client import AnomalySageClient
+from ..shared.exceptions import ValidationError
+
+logger = logging.getLogger(__name__)
+
+class RequestRouter:
+    """Routes requests to appropriate AI agents based on intent"""
+    
+    def __init__(self, config):
+        self.config = config
+        
+        # Initialize agent clients
+        self.contact_sage = ContactSageClient(config.contact_sage_addr)
+        self.transaction_sage = TransactionSageClient(config.transaction_sage_addr)
+        self.money_sage = MoneySageClient(config.money_sage_addr)
+        self.anomaly_sage = AnomalySageClient(config.anomaly_sage_addr)
+    
+    async def route_request(self, intent: str, parameters: Dict[str, Any], token: str) -> Dict[str, Any]:
+        """
+        Route request to appropriate agent based on intent
+        
+        Returns:
+            Result from the appropriate agent service
+        """
+        try:
+            if intent == "check.balance":
+                return await self._handle_balance_check(parameters, token)
+            
+            elif intent == "view.transactions":
+                return await self._handle_view_transactions(parameters, token)
+            
+            elif intent == "transfer.money":
+                return await self._handle_transfer_money(parameters, token)
+            
+            elif intent == "deposit.money":
+                return await self._handle_deposit_money(parameters, token)
+            
+            elif intent == "list.contacts":
+                return await self._handle_list_contacts(parameters, token)
+            
+            elif intent == "contact.details":
+                return await self._handle_contact_details(parameters, token)
+            
+            elif intent == "convert.currency":
+                return await self._handle_currency_conversion(parameters, token)
+            
+            elif intent in ["greeting", "help.banking"]:
+                return await self._handle_informational(intent, parameters, token)
+            
+            else:
+                return {
+                    "status": "error",
+                    "error_message": f"Unknown intent: {intent}"
+                }
+                
+        except Exception as e:
+            logger.error(f"Routing error for intent {intent}: {e}")
+            return {
+                "status": "error", 
+                "error_message": "Internal service error"
+            }
+    
+    async def _handle_balance_check(self, parameters: Dict, token: str) -> Dict[str, Any]:
+        """Handle balance check request"""
+        # This goes directly to core balance service for now
+        # Future enhancement: could route through Money-Sage for enriched responses
+        return await self.money_sage.get_balance(token, parameters.get("to_currency"))
+    
+    async def _handle_view_transactions(self, parameters: Dict, token: str) -> Dict[str, Any]:
+        """Handle view transactions request"""
+        limit = int(parameters.get("limit", 10))
+        time_period = parameters.get("time_period", "recent")
+        
+        # Route through Money-Sage for enriched transaction data
+        return await self.money_sage.get_transaction_history(token, limit, time_period)
+    
+    async def _handle_transfer_money(self, parameters: Dict, token: str) -> Dict[str, Any]:
+        """Handle money transfer request"""
+        amount = parameters.get("amount")
+        recipient = parameters.get("recipient")
+        
+        if not amount or not recipient:
+            return {
+                "status": "error",
+                "error_message": "Amount and recipient are required for transfers"
+            }
+        
+        # First resolve contact if needed
+        resolved_recipient = await self.contact_sage.resolve_contact(token, recipient)
+        if resolved_recipient.get("status") == "error":
+            return resolved_recipient
+        
+        # Check for anomalies before executing
+        anomaly_result = await self.anomaly_sage.check_transaction_risk(
+            token, amount, resolved_recipient.get("account_id", recipient)
+        )
+        
+        if anomaly_result.get("status") == "blocked":
+            return {
+                "status": "error",
+                "error_message": f"Transaction blocked: {anomaly_result.get('reason', 'Suspicious activity detected')}"
+            }
+        elif anomaly_result.get("status") == "requires_confirmation":
+            return {
+                "status": "confirmation_required",
+                "message": anomaly_result.get("message"),
+                "confirmation_method": "email"
+            }
+        
+        # Execute transfer through Transaction-Sage
+        return await self.transaction_sage.execute_transfer(
+            token, amount, resolved_recipient.get("account_id", recipient), parameters
+        )
+    
+    async def _handle_deposit_money(self, parameters: Dict, token: str) -> Dict[str, Any]:
+        """Handle money deposit request"""
+        amount = parameters.get("amount")
+        
+        if not amount:
+            return {
+                "status": "error",
+                "error_message": "Amount is required for deposits"
+            }
+        
+        # Check for anomalies 
+        anomaly_result = await self.anomaly_sage.check_transaction_risk(
+            token, amount, "DEPOSIT"
+        )
+        
+        if anomaly_result.get("status") == "blocked":
+            return {
+                "status": "error", 
+                "error_message": f"Deposit blocked: {anomaly_result.get('reason')}"
+            }
+        
+        # Execute deposit through Transaction-Sage
+        return await self.transaction_sage.execute_deposit(token, amount, parameters)
+    
+    async def _handle_list_contacts(self, parameters: Dict, token: str) -> Dict[str, Any]:
+        """Handle list contacts request"""
+        limit = parameters.get("limit")
+        return await self.contact_sage.get_contacts(token, limit)
+    
+    async def _handle_contact_details(self, parameters: Dict, token: str) -> Dict[str, Any]:
+        """Handle contact details request"""
+        contact_name = parameters.get("contact_name")
+        
+        if not contact_name:
+            return {
+                "status": "error",
+                "error_message": "Contact name is required"
+            }
+        
+        return await self.contact_sage.get_contact_details(token, contact_name)
+    
+    async def _handle_currency_conversion(self, parameters: Dict, token: str) -> Dict[str, Any]:
+        """Handle currency conversion request"""
+        amount = parameters.get("amount")
+        from_currency = parameters.get("from_currency", "USD")
+        to_currency = parameters.get("to_currency", "USD")
+        
+        if not amount or not to_currency:
+            return {
+                "status": "error",
+                "error_message": "Amount and target currency are required"
+            }
+        
+        # Simple currency conversion (could route through Money-Sage for more features)
+        return await self.money_sage.convert_currency(amount, from_currency, to_currency)
+    
+    async def _handle_informational(self, intent: str, parameters: Dict, token: str) -> Dict[str, Any]:
+        """Handle informational requests (greeting, help)"""
+        responses = {
+            "greeting": "Hello! I'm your Bank of Anthos AI assistant. How can I help you today?",
+            "help.banking": "I can help you check balances, transfer money, view transactions, manage contacts, and more. What would you like to do?"
+        }
+        
+        return {
+            "status": "success",
+            "message": responses.get(intent, "I'm here to help with your banking needs."),
+            "requires_action": False
+        }

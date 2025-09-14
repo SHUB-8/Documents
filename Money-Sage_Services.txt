@@ -1,0 +1,776 @@
+# ai-services/money-sage/service.py
+"""
+Money-Sage: Provides financial intelligence and insights
+"""
+
+import os
+import jwt
+import logging
+import requests
+from datetime import datetime, date, timedelta
+from typing import Dict, Any, Optional, List
+from fastapi import FastAPI, HTTPException, Depends, Header, Query
+from fastapi.middleware.cors import CORSMiddleware
+from sqlalchemy.orm import Session
+
+from .schemas.spend_summary import SpendingSummaryRequest, SpendingSummaryResponse
+from .schemas.budget_management import BudgetCreateRequest, BudgetResponse, BudgetUsageResponse
+from .budget_manager import BudgetManager
+from .config import MoneySageConfig
+from ..ai_meta_db.models import get_db
+from ..ai_meta_db.repository.ai_meta_repository import AIMetaRepository
+from ..shared.logging_utils import setup_logging
+from ..shared.exceptions import AuthenticationError, ValidationError
+from ..shared.constants import CURRENCY_RATES
+
+# Setup logging
+logger = setup_logging("money-sage")
+
+app = FastAPI(title="Money-Sage", version="1.0.0")
+
+# Add CORS middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Initialize configuration
+config = MoneySageConfig()
+budget_manager = BudgetManager()
+
+def verify_token(authorization: str = Header(...)) -> Dict[str, str]:
+    """Verify JWT token and extract user data"""
+    try:
+        if not authorization.startswith("Bearer "):
+            raise AuthenticationError("Invalid authorization header")
+        
+        token = authorization[7:]
+        
+        if not config.jwt_public_key:
+            logger.warning("No JWT public key configured")
+            payload = jwt.decode(token, options={"verify_signature": False})
+        else:
+            payload = jwt.decode(token, config.jwt_public_key, algorithms=['RS256'])
+        
+        return {
+            'username': payload.get('user'),
+            'account_id': payload.get('acct'),
+            'name': payload.get('name'),
+            'token': token
+        }
+    except jwt.exceptions.InvalidTokenError as e:
+        logger.error(f"Token validation failed: {e}")
+        raise AuthenticationError("Invalid token")
+    except Exception as e:
+        logger.error(f"Authentication error: {e}")
+        raise AuthenticationError("Authentication failed")
+
+@app.get("/health")
+def health_check():
+    """Health check endpoint"""
+    return {"status": "healthy", "service": "money-sage"}
+
+@app.get("/balance")
+async def get_balance(to_currency: Optional[str] = Query(None),
+                     user_data: Dict[str, str] = Depends(verify_token)):
+    """Get account balance with optional currency conversion"""
+    try:
+        account_id = user_data.get('account_id')
+        token = user_data.get('token')
+        
+        if not account_id:
+            raise HTTPException(status_code=400, detail="Account ID not found in token")
+        
+        # Get balance from core service
+        balance_result = await _get_core_balance(account_id, token)
+        
+        if balance_result.get("status") != "success":
+            return balance_result
+        
+        raw_balance = balance_result.get("raw_balance", 0)
+        balance_usd = raw_balance / 100 if raw_balance > 10000 else raw_balance
+        
+        # Convert currency if requested
+        if to_currency and to_currency.upper() != 'USD':
+            try:
+                currency_key = to_currency.lower()
+                if currency_key in CURRENCY_RATES:
+                    converted_balance = balance_usd / CURRENCY_RATES[currency_key]
+                    balance_display = f"{converted_balance:,.2f} {to_currency.upper()}"
+                else:
+                    balance_display = f"{balance_usd:,.2f} USD (conversion to {to_currency} not available)"
+            except Exception as e:
+                logger.error(f"Currency conversion error: {e}")
+                balance_display = f"{balance_usd:,.2f} USD"
+        else:
+            balance_display = f"${balance_usd:,.2f}"
+        
+        return {
+            "status": "success",
+            "balance": balance_display,
+            "raw_balance_usd": balance_usd,
+            "currency": to_currency.upper() if to_currency else "USD"
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Balance retrieval error: {e}")
+        raise HTTPException(status_code=500, detail="Unable to retrieve balance")
+
+@app.get("/transactions")
+async def get_transaction_history(limit: int = Query(10, ge=1, le=100),
+                                 time_period: str = Query("recent"),
+                                 user_data: Dict[str, str] = Depends(verify_token),
+                                 db: Session = Depends(get_db)):
+    """Get enriched transaction history with categories and insights"""
+    try:
+        account_id = user_data.get('account_id')
+        token = user_data.get('token')
+        
+        if not account_id:
+            raise HTTPException(status_code=400, detail="Account ID not found in token")
+        
+        # Get transactions from core service
+        transactions_result = await _get_core_transactions(account_id, token, limit, time_period)
+        
+        if transactions_result.get("status") != "success":
+            return transactions_result
+        
+        transactions = transactions_result.get("transactions", [])
+        
+        # Enrich transactions with categories and merchant info
+        repo = AIMetaRepository(db)
+        enriched_transactions = []
+        
+        for txn in transactions:
+            txn_id = txn.get('transaction_id') or txn.get('id', 0)
+            
+            # Look for existing annotation
+            annotations = repo.get_transaction_annotations(account_id, limit=1000)
+            annotation = next((a for a in annotations if a.transaction_id == txn_id), None)
+            
+            enriched_txn = txn.copy()
+            if annotation:
+                enriched_txn['category'] = annotation.category
+                enriched_txn['merchant_name'] = annotation.merchant_name
+                enriched_txn['user_note'] = annotation.user_note
+            else:
+                enriched_txn['category'] = 'Uncategorized'
+                enriched_txn['merchant_name'] = 'Unknown'
+            
+            enriched_transactions.append(enriched_txn)
+        
+        # Generate summary insights
+        insights = _generate_transaction_insights(enriched_transactions, account_id)
+        
+        return {
+            "status": "success",
+            "transactions": enriched_transactions,
+            "summary": transactions_result.get("transaction_summary", ""),
+            "insights": insights,
+            "count": len(enriched_transactions)
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Transaction history error: {e}")
+        raise HTTPException(status_code=500, detail="Unable to retrieve transaction history")
+
+@app.post("/convert")
+async def convert_currency(amount: str, from_currency: str = "USD", to_currency: str = "USD"):
+    """Convert currency using current rates"""
+    try:
+        # Parse amount
+        amount_clean = amount.replace("$", "").replace(",", "")
+        amount_float = float(amount_clean)
+        
+        if amount_float < 0:
+            raise ValidationError("Amount must be positive")
+        
+        # Convert currencies
+        from_key = from_currency.lower()
+        to_key = to_currency.lower()
+        
+        if from_key not in CURRENCY_RATES or to_key not in CURRENCY_RATES:
+            available_currencies = list(CURRENCY_RATES.keys())
+            return {
+                "status": "error",
+                "error_message": f"Currency not supported. Available: {available_currencies}"
+            }
+        
+        # Convert to USD first, then to target currency
+        usd_amount = amount_float * CURRENCY_RATES[from_key]
+        converted_amount = usd_amount / CURRENCY_RATES[to_key]
+        
+        return {
+            "status": "success",
+            "conversion_result": f"{amount_float:,.2f} {from_currency.upper()} = {converted_amount:,.2f} {to_currency.upper()}",
+            "original_amount": amount_float,
+            "converted_amount": converted_amount,
+            "from_currency": from_currency.upper(),
+            "to_currency": to_currency.upper(),
+            "rate": converted_amount / amount_float if amount_float > 0 else 0
+        }
+        
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid amount format")
+    except ValidationError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        logger.error(f"Currency conversion error: {e}")
+        raise HTTPException(status_code=500, detail="Currency conversion failed")
+
+@app.get("/spending-summary")
+async def get_spending_summary(period: str = Query("monthly"),
+                              user_data: Dict[str, str] = Depends(verify_token),
+                              db: Session = Depends(get_db)):
+    """Get spending summary and insights"""
+    try:
+        account_id = user_data.get('account_id')
+        token = user_data.get('token')
+        
+        if not account_id:
+            raise HTTPException(status_code=400, detail="Account ID not found in token")
+        
+        # Get recent transactions for analysis
+        transactions_result = await _get_core_transactions(account_id, token, 100, "recent")
+        
+        if transactions_result.get("status") != "success":
+            return {"status": "error", "error_message": "Unable to retrieve transactions for analysis"}
+        
+        transactions = transactions_result.get("transactions", [])
+        
+        # Analyze spending patterns
+        repo = AIMetaRepository(db)
+        annotations = repo.get_transaction_annotations(account_id, 100)
+        
+        spending_analysis = _analyze_spending_patterns(transactions, annotations, period)
+        
+        return {
+            "status": "success",
+            "period": period,
+            "summary": spending_analysis,
+            "generated_at": datetime.now().isoformat()
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Spending summary error: {e}")
+        raise HTTPException(status_code=500, detail="Unable to generate spending summary")
+
+@app.post("/budgets", response_model=BudgetResponse)
+async def create_budget(request: BudgetCreateRequest,
+                       user_data: Dict[str, str] = Depends(verify_token),
+                       db: Session = Depends(get_db)):
+    """Create new budget"""
+    try:
+        account_id = user_data.get('account_id')
+        
+        if not account_id:
+            raise HTTPException(status_code=400, detail="Account ID not found in token")
+        
+        repo = AIMetaRepository(db)
+        
+        # Create budget
+        budget = repo.create_budget(
+            account_id=account_id,
+            name=request.name,
+            amount_cents=int(request.amount_dollars * 100),
+            periodicity=request.periodicity,
+            category=request.category,
+            start_date=request.start_date or date.today(),
+            end_date=request.end_date
+        )
+        
+        return BudgetResponse(
+            status="success",
+            budget_id=str(budget.budget_id),
+            message=f"Budget '{request.name}' created successfully"
+        )
+        
+    except Exception as e:
+        logger.error(f"Budget creation error: {e}")
+        raise HTTPException(status_code=500, detail="Unable to create budget")
+
+@app.get("/budgets")
+async def get_budgets(user_data: Dict[str, str] = Depends(verify_token),
+                     db: Session = Depends(get_db)):
+    """Get user budgets with usage information"""
+    try:
+        account_id = user_data.get('account_id')
+        
+        if not account_id:
+            raise HTTPException(status_code=400, detail="Account ID not found in token")
+        
+        repo = AIMetaRepository(db)
+        budgets = repo.get_budgets(account_id)
+        
+        budget_data = []
+        for budget in budgets:
+            # Get usage for current period
+            current_usage = budget_manager.calculate_current_usage(budget, repo)
+            
+            budget_info = {
+                "budget_id": str(budget.budget_id),
+                "name": budget.name,
+                "category": budget.category,
+                "amount_dollars": budget.amount_cents / 100,
+                "periodicity": budget.periodicity,
+                "start_date": budget.start_date.isoformat() if budget.start_date else None,
+                "end_date": budget.end_date.isoformat() if budget.end_date else None,
+                "spent_dollars": current_usage.get("spent_dollars", 0),
+                "remaining_dollars": (budget.amount_cents / 100) - current_usage.get("spent_dollars", 0),
+                "usage_percentage": current_usage.get("usage_percentage", 0)
+            }
+            budget_data.append(budget_info)
+        
+        return {
+            "status": "success",
+            "budgets": budget_data
+        }
+        
+    except Exception as e:
+        logger.error(f"Get budgets error: {e}")
+        raise HTTPException(status_code=500, detail="Unable to retrieve budgets")
+
+async def _get_core_balance(account_id: str, token: str) -> Dict[str, Any]:
+    """Get balance from core balance service"""
+    try:
+        url = f"http://{config.balance_api_addr}/balances/{account_id}"
+        headers = {"Authorization": f"Bearer {token}"}
+        
+        response = requests.get(url, headers=headers, timeout=config.backend_timeout)
+        
+        if response.status_code == 200:
+            try:
+                balance_data = response.json()
+                balance = balance_data.get('balance', 0) if isinstance(balance_data, dict) else balance_data
+            except:
+                balance = float(response.text.strip())
+            
+            return {
+                "status": "success",
+                "raw_balance": balance
+            }
+        else:
+            return {"status": "error", "error_message": "Balance service unavailable"}
+            
+    except Exception as e:
+        logger.error(f"Core balance error: {e}")
+        return {"status": "error", "error_message": "Balance service error"}
+
+async def _get_core_transactions(account_id: str, token: str, limit: int, time_period: str) -> Dict[str, Any]:
+    """Get transactions from core transaction history service"""
+    try:
+        url = f"http://{config.transactions_api_addr}/transactions/{account_id}"
+        headers = {"Authorization": f"Bearer {token}"}
+        
+        response = requests.get(url, headers=headers, timeout=config.backend_timeout)
+        
+        if response.status_code == 200:
+            transactions = response.json()
+            
+            if transactions:
+                # Sort and filter based on time_period
+                if time_period == "first":
+                    transactions.reverse()
+                    selected_txns = transactions[:min(limit, len(transactions))]
+                    period_desc = f"first {len(selected_txns)}"
+                else:
+                    selected_txns = transactions[:min(limit, len(transactions))]
+                    period_desc = f"last {len(selected_txns)}"
+                
+                # Format transaction summary
+                transaction_list = []
+                for txn in selected_txns:
+                    amount = txn.get('amount', 0) / 100
+                    from_account = txn.get('fromAccountId', 'Unknown')
+                    to_account = txn.get('toAccountId', 'Unknown')
+                    timestamp = txn.get('timestamp', 'Unknown time')
+                    
+                    try:
+                        dt = datetime.fromisoformat(timestamp.replace('Z', '+00:00'))
+                        timestamp_str = dt.strftime('%b %d, %H:%M')
+                    except:
+                        timestamp_str = timestamp
+                    
+                    if from_account == account_id:
+                        transaction_list.append(f"• Sent ${amount:,.2f} to {to_account} on {timestamp_str}")
+                    elif to_account == account_id:
+                        transaction_list.append(f"• Received ${amount:,.2f} from {from_account} on {timestamp_str}")
+                
+                transactions_text = f"Your {period_desc} transactions:\n" + "\n".join(transaction_list)
+                
+                return {
+                    "status": "success",
+                    "transactions": selected_txns,
+                    "transaction_summary": transactions_text,
+                    "count": len(selected_txns)
+                }
+            else:
+                return {
+                    "status": "success",
+                    "transactions": [],
+                    "transaction_summary": "You have no transactions yet.",
+                    "count": 0
+                }
+        else:
+            return {"status": "error", "error_message": "Transaction service unavailable"}
+            
+    except Exception as e:
+        logger.error(f"Core transactions error: {e}")
+        return {"status": "error", "error_message": "Transaction service error"}
+
+def _generate_transaction_insights(transactions: List[Dict], account_id: str) -> Dict[str, Any]:
+    """Generate insights from transaction data"""
+    if not transactions:
+        return {"message": "No transactions to analyze"}
+    
+    # Calculate spending by category
+    category_spending = {}
+    total_spending = 0
+    total_income = 0
+    
+    for txn in transactions:
+        amount = txn.get('amount', 0) / 100
+        category = txn.get('category', 'Uncategorized')
+        from_account = txn.get('fromAccountId', '')
+        to_account = txn.get('toAccountId', '')
+        
+        if from_account == account_id:  # Outgoing transaction
+            total_spending += amount
+            category_spending[category] = category_spending.get(category, 0) + amount
+        elif to_account == account_id:  # Incoming transaction
+            total_income += amount
+    
+    # Top spending category
+    top_category = max(category_spending.items(), key=lambda x: x[1]) if category_spending else None
+    
+    insights = {
+        "total_spending": f"${total_spending:,.2f}",
+        "total_income": f"${total_income:,.2f}",
+        "net_change": f"${total_income - total_spending:,.2f}",
+        "top_spending_category": {
+            "category": top_category[0] if top_category else "None",
+            "amount": f"${top_category[1]:,.2f}" if top_category else "$0.00"
+        },
+        "category_breakdown": {cat: f"${amt:,.2f}" for cat, amt in category_spending.items()},
+        "transaction_count": len(transactions)
+    }
+    
+    return insights
+
+def _analyze_spending_patterns(transactions: List[Dict], annotations: List, period: str) -> Dict[str, Any]:
+    """Analyze spending patterns for the specified period"""
+    # This is a simplified analysis - in production would be more sophisticated
+    
+    if not transactions:
+        return {"message": "No transactions to analyze"}
+    
+    # Basic spending analysis
+    daily_spending = {}
+    category_spending = {}
+    
+    for txn in transactions:
+        amount = txn.get('amount', 0) / 100
+        timestamp = txn.get('timestamp', '')
+        
+        try:
+            dt = datetime.fromisoformat(timestamp.replace('Z', '+00:00'))
+            day_key = dt.strftime('%Y-%m-%d')
+            
+            daily_spending[day_key] = daily_spending.get(day_key, 0) + amount
+            
+            # Find annotation for this transaction
+            txn_id = txn.get('transaction_id', txn.get('id', 0))
+            annotation = next((a for a in annotations if a.transaction_id == txn_id), None)
+            
+            if annotation and annotation.category:
+                category = annotation.category
+            else:
+                category = 'Uncategorized'
+                
+            category_spending[category] = category_spending.get(category, 0) + amount
+            
+        except Exception:
+            continue
+    
+    # Calculate averages and trends
+    avg_daily_spending = sum(daily_spending.values()) / len(daily_spending) if daily_spending else 0
+    
+    return {
+        "period": period,
+        "average_daily_spending": f"${avg_daily_spending:.2f}",
+        "total_spending": f"${sum(daily_spending.values()):.2f}",
+        "spending_days": len(daily_spending),
+        "top_categories": dict(sorted(category_spending.items(), key=lambda x: x[1], reverse=True)[:5]),
+        "trends": {
+            "message": "Spending analysis complete",
+            "recommendation": "Consider setting budgets for your top spending categories"
+        }
+    }
+
+if __name__ == "__main__":
+    import uvicorn
+    port = int(os.getenv("PORT", "8080"))
+    uvicorn.run(app, host="0.0.0.0", port=port)
+
+# ai-services/money-sage/schemas/spend_summary.py
+"""
+Spending summary schemas
+"""
+
+from pydantic import BaseModel, Field
+from typing import Dict, Any, Optional
+from datetime import date
+
+class SpendingSummaryRequest(BaseModel):
+    """Request for spending summary"""
+    period: str = Field("monthly", description="Analysis period: daily, weekly, monthly, quarterly")
+    start_date: Optional[date] = Field(None, description="Start date for custom period")
+    end_date: Optional[date] = Field(None, description="End date for custom period")
+    category: Optional[str] = Field(None, description="Filter by category")
+
+class SpendingSummaryResponse(BaseModel):
+    """Response with spending summary"""
+    status: str = Field(..., description="Response status")
+    period: str = Field(..., description="Analysis period")
+    summary: Dict[str, Any] = Field(..., description="Spending analysis data")
+    insights: Optional[Dict[str, Any]] = Field(None, description="Additional insights")
+    generated_at: str = Field(..., description="Summary generation timestamp")
+
+# ai-services/money-sage/schemas/budget_management.py
+"""
+Budget management schemas
+"""
+
+from pydantic import BaseModel, Field
+from typing import Optional
+from datetime import date
+
+class BudgetCreateRequest(BaseModel):
+    """Request to create budget"""
+    name: str = Field(..., description="Budget name")
+    amount_dollars: float = Field(..., description="Budget amount in dollars")
+    category: Optional[str] = Field(None, description="Budget category")
+    periodicity: str = Field("monthly", description="Budget period: weekly, monthly, quarterly, yearly")
+    start_date: Optional[date] = Field(None, description="Budget start date")
+    end_date: Optional[date] = Field(None, description="Budget end date (null for ongoing)")
+
+class BudgetResponse(BaseModel):
+    """Response from budget operations"""
+    status: str = Field(..., description="Operation status")
+    budget_id: Optional[str] = Field(None, description="Created/updated budget ID")
+    message: Optional[str] = Field(None, description="Success message")
+    error_message: Optional[str] = Field(None, description="Error details if failed")
+
+class BudgetUsageResponse(BaseModel):
+    """Budget usage information"""
+    budget_id: str = Field(..., description="Budget ID")
+    budget_name: str = Field(..., description="Budget name")
+    amount_dollars: float = Field(..., description="Budget amount")
+    spent_dollars: float = Field(..., description="Amount spent")
+    remaining_dollars: float = Field(..., description="Amount remaining")
+    usage_percentage: float = Field(..., description="Usage percentage")
+    status: str = Field(..., description="Budget status: on_track, warning, exceeded")
+
+# ai-services/money-sage/budget_manager.py
+"""
+Budget management logic
+"""
+
+import logging
+from datetime import date, datetime, timedelta
+from typing import Dict, Any, List
+from calendar import monthrange
+
+logger = logging.getLogger(__name__)
+
+class BudgetManager:
+    """Manages budget calculations and notifications"""
+    
+    def __init__(self):
+        self.warning_threshold = 0.8  # 80% of budget
+        self.critical_threshold = 1.0  # 100% of budget
+    
+    def calculate_current_usage(self, budget, repo) -> Dict[str, Any]:
+        """Calculate current budget usage"""
+        try:
+            # Determine current period dates
+            period_start, period_end = self._get_current_period_dates(
+                budget.periodicity, budget.start_date
+            )
+            
+            # Get spending for this period
+            spent_cents = self._calculate_period_spending(
+                budget.account_id, period_start, period_end, budget.category, repo
+            )
+            
+            spent_dollars = spent_cents / 100
+            budget_dollars = budget.amount_cents / 100
+            usage_percentage = (spent_dollars / budget_dollars) * 100 if budget_dollars > 0 else 0
+            
+            # Determine status
+            if usage_percentage >= 100:
+                status = "exceeded"
+            elif usage_percentage >= 80:
+                status = "warning"
+            else:
+                status = "on_track"
+            
+            return {
+                "spent_dollars": spent_dollars,
+                "budget_dollars": budget_dollars,
+                "remaining_dollars": budget_dollars - spent_dollars,
+                "usage_percentage": usage_percentage,
+                "status": status,
+                "period_start": period_start,
+                "period_end": period_end
+            }
+            
+        except Exception as e:
+            logger.error(f"Budget usage calculation error: {e}")
+            return {
+                "spent_dollars": 0,
+                "budget_dollars": budget.amount_cents / 100,
+                "remaining_dollars": budget.amount_cents / 100,
+                "usage_percentage": 0,
+                "status": "error",
+                "error": str(e)
+            }
+    
+    def _get_current_period_dates(self, periodicity: str, start_date: date) -> tuple[date, date]:
+        """Get start and end dates for current budget period"""
+        today = date.today()
+        
+        if periodicity == "weekly":
+            # Find the start of current week relative to budget start
+            days_since_start = (today - start_date).days
+            weeks_passed = days_since_start // 7
+            period_start = start_date + timedelta(weeks=weeks_passed)
+            period_end = period_start + timedelta(days=6)
+            
+        elif periodicity == "monthly":
+            # Current month
+            period_start = today.replace(day=1)
+            next_month = period_start + timedelta(days=32)
+            period_end = next_month.replace(day=1) - timedelta(days=1)
+            
+        elif periodicity == "quarterly":
+            # Current quarter
+            quarter = (today.month - 1) // 3
+            period_start = date(today.year, quarter * 3 + 1, 1)
+            if quarter == 3:  # Q4
+                period_end = date(today.year, 12, 31)
+            else:
+                next_quarter_start = date(today.year, (quarter + 1) * 3 + 1, 1)
+                period_end = next_quarter_start - timedelta(days=1)
+                
+        elif periodicity == "yearly":
+            # Current year
+            period_start = date(today.year, 1, 1)
+            period_end = date(today.year, 12, 31)
+            
+        else:  # one_off or unknown
+            period_start = start_date
+            period_end = today
+        
+        return period_start, period_end
+    
+    def _calculate_period_spending(self, account_id: str, start_date: date, 
+                                  end_date: date, category: str, repo) -> int:
+        """Calculate spending for period, optionally filtered by category"""
+        try:
+            # This is a simplified implementation
+            # In practice, would query transactions within date range
+            
+            # Get recent annotations (this is a placeholder)
+            annotations = repo.get_transaction_annotations(account_id, 100)
+            
+            total_spent_cents = 0
+            
+            # Filter annotations by date range and category
+            for annotation in annotations:
+                # Note: This is simplified - would need actual transaction data with dates
+                if category and annotation.category != category:
+                    continue
+                
+                # For now, just sum up some placeholder amounts
+                # In reality, would get transaction amounts from transaction history
+                total_spent_cents += 5000  # Placeholder $50
+            
+            return total_spent_cents
+            
+        except Exception as e:
+            logger.error(f"Period spending calculation error: {e}")
+            return 0
+    
+    def check_budget_alerts(self, budget, current_usage: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """Check if budget alerts should be sent"""
+        alerts = []
+        
+        usage_percentage = current_usage.get("usage_percentage", 0)
+        
+        if usage_percentage >= 100:
+            alerts.append({
+                "type": "budget_exceeded",
+                "message": f"Budget '{budget.name}' has been exceeded! "
+                          f"Spent: ${current_usage.get('spent_dollars', 0):.2f} "
+                          f"of ${current_usage.get('budget_dollars', 0):.2f}",
+                "severity": "critical"
+            })
+        elif usage_percentage >= 80:
+            alerts.append({
+                "type": "budget_warning",
+                "message": f"Budget '{budget.name}' is at {usage_percentage:.1f}% "
+                          f"(${current_usage.get('spent_dollars', 0):.2f} "
+                          f"of ${current_usage.get('budget_dollars', 0):.2f})",
+                "severity": "warning"
+            })
+        
+        return alerts
+
+# ai-services/money-sage/config.py
+"""
+Configuration for Money-Sage service
+"""
+
+import os
+import base64
+
+class MoneySageConfig:
+    """Configuration for Money-Sage"""
+    
+    def __init__(self):
+        # Core service addresses
+        self.balance_api_addr = os.getenv('BALANCES_API_ADDR', 'balancereader:8080')
+        self.transactions_api_addr = os.getenv('HISTORY_API_ADDR', 'transactionhistory:8080')
+        
+        # Authentication
+        self.jwt_public_key = self._load_public_key()
+        
+        # Service settings
+        self.backend_timeout = int(os.getenv('BACKEND_TIMEOUT', '10'))
+        
+    def _load_public_key(self) -> str:
+        """Load JWT public key"""
+        try:
+            public_key_path = "/tmp/.ssh/publickey"
+            if os.path.exists(public_key_path):
+                with open(public_key_path, 'r') as f:
+                    return f.read()
+            
+            public_key_b64 = os.getenv('JWT_PUBLIC_KEY')
+            if public_key_b64:
+                return base64.b64decode(public_key_b64).decode('utf-8')
+                
+            return None
+        except Exception as e:
+            print(f"Error loading public key: {e}")
+            return None

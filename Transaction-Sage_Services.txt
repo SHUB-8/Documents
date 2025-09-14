@@ -1,0 +1,662 @@
+# ai-services/transaction-sage/service.py
+"""
+Transaction-Sage: Handles transaction execution and annotation
+"""
+
+import os
+import uuid
+import jwt
+import logging
+import requests
+import asyncio
+from datetime import datetime
+from typing import Dict, Any, Optional
+from fastapi import FastAPI, HTTPException, Depends, Header
+from fastapi.middleware.cors import CORSMiddleware
+from sqlalchemy.orm import Session
+
+from .schemas.transaction_execute import TransferExecuteRequest, DepositExecuteRequest, TransactionResponse
+from .schemas.annotate_transaction import AnnotateTransactionRequest, AnnotationResponse
+from .merchant_normalizer import MerchantNormalizer
+from .category_model import CategoryClassifier
+from .config import TransactionSageConfig
+from ..ai_meta_db.models import get_db
+from ..ai_meta_db.repository.ai_meta_repository import AIMetaRepository
+from ..shared.logging_utils import setup_logging
+from ..shared.exceptions import AuthenticationError, ValidationError, InsufficientFundsError
+from ..shared.utils import validate_account_number, generate_transaction_id
+
+# Setup logging
+logger = setup_logging("transaction-sage")
+
+app = FastAPI(title="Transaction-Sage", version="1.0.0")
+
+# Add CORS middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Initialize configuration
+config = TransactionSageConfig()
+merchant_normalizer = MerchantNormalizer()
+category_classifier = CategoryClassifier()
+
+def verify_token(authorization: str = Header(...)) -> Dict[str, str]:
+    """Verify JWT token and extract user data"""
+    try:
+        if not authorization.startswith("Bearer "):
+            raise AuthenticationError("Invalid authorization header")
+        
+        token = authorization[7:]
+        
+        if not config.jwt_public_key:
+            logger.warning("No JWT public key configured")
+            payload = jwt.decode(token, options={"verify_signature": False})
+        else:
+            payload = jwt.decode(token, config.jwt_public_key, algorithms=['RS256'])
+        
+        return {
+            'username': payload.get('user'),
+            'account_id': payload.get('acct'),
+            'name': payload.get('name'),
+            'token': token
+        }
+    except jwt.exceptions.InvalidTokenError as e:
+        logger.error(f"Token validation failed: {e}")
+        raise AuthenticationError("Invalid token")
+    except Exception as e:
+        logger.error(f"Authentication error: {e}")
+        raise AuthenticationError("Authentication failed")
+
+@app.get("/health")
+def health_check():
+    """Health check endpoint"""
+    return {"status": "healthy", "service": "transaction-sage"}
+
+@app.post("/transfer", response_model=TransactionResponse)
+async def execute_transfer(request: TransferExecuteRequest,
+                          user_data: Dict[str, str] = Depends(verify_token),
+                          db: Session = Depends(get_db)):
+    """Execute money transfer"""
+    try:
+        account_id = user_data.get('account_id')
+        token = user_data.get('token')
+        
+        if not account_id:
+            raise HTTPException(status_code=400, detail="Account ID not found in token")
+        
+        # Validate amount
+        try:
+            amount_clean = request.amount.replace("$", "").replace(",", "")
+            amount_float = float(amount_clean)
+            if amount_float <= 0:
+                raise ValidationError("Amount must be greater than zero")
+            if amount_float > 10000:  # Same limit as original
+                raise ValidationError("Transfer amount exceeds daily limit of $10,000")
+        except ValueError:
+            raise ValidationError("Invalid amount format")
+        
+        amount_cents = int(amount_float * 100)
+        
+        # Validate recipient account
+        if not validate_account_number(request.recipient_account):
+            raise ValidationError("Invalid recipient account number")
+        
+        # Get pre-transaction balance
+        pre_balance = await _get_account_balance(token)
+        
+        # Execute transfer via core ledger service
+        result = await _execute_core_transfer(
+            token, account_id, request.recipient_account, amount_cents
+        )
+        
+        if result.get("status") == "success":
+            # Get updated balance
+            new_balance = "Unknown"
+            for attempt in range(5):
+                await asyncio.sleep(0.3)
+                balance_result = await _get_account_balance(token)
+                if balance_result != pre_balance:
+                    new_balance = balance_result
+                    break
+            
+            # Create annotation in AI-Meta DB
+            try:
+                repo = AIMetaRepository(db)
+                annotation = repo.create_transaction_annotation(
+                    transaction_id=result.get("transaction_id", 0),  # Would get real ID from response
+                    account_id=account_id,
+                    merchant_name=f"Transfer to {request.recipient_account}",
+                    category="Transfer"
+                )
+                logger.info(f"Created transaction annotation: {annotation.annotation_id}")
+            except Exception as e:
+                logger.warning(f"Failed to create annotation: {e}")
+            
+            return TransactionResponse(
+                status="success",
+                transaction_id=result.get("transaction_id"),
+                new_balance=new_balance,
+                message=f"Successfully transferred ${amount_float:,.2f} to {request.recipient_account}"
+            )
+        else:
+            return TransactionResponse(
+                status="error",
+                error_message=result.get("error_message", "Transfer failed")
+            )
+            
+    except ValidationError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except InsufficientFundsError as e:
+        raise HTTPException(status_code=402, detail=str(e))
+    except Exception as e:
+        logger.error(f"Transfer execution error: {e}")
+        raise HTTPException(status_code=500, detail="Unable to complete transfer")
+
+@app.post("/deposit", response_model=TransactionResponse)
+async def execute_deposit(request: DepositExecuteRequest,
+                         user_data: Dict[str, str] = Depends(verify_token),
+                         db: Session = Depends(get_db)):
+    """Execute money deposit"""
+    try:
+        account_id = user_data.get('account_id')
+        token = user_data.get('token')
+        
+        if not account_id:
+            raise HTTPException(status_code=400, detail="Account ID not found in token")
+        
+        # Validate amount
+        try:
+            amount_clean = request.amount.replace("$", "").replace(",", "")
+            amount_float = float(amount_clean)
+            if amount_float <= 0:
+                raise ValidationError("Amount must be greater than zero")
+            if amount_float > 50000:  # Same limit as original
+                raise ValidationError("Deposit amount exceeds limit of $50,000")
+        except ValueError:
+            raise ValidationError("Invalid amount format")
+        
+        amount_cents = int(amount_float * 100)
+        
+        # Get pre-transaction balance
+        pre_balance = await _get_account_balance(token)
+        
+        # Execute deposit via core ledger service
+        result = await _execute_core_deposit(token, account_id, amount_cents)
+        
+        if result.get("status") == "success":
+            # Get updated balance
+            new_balance = "Unknown"
+            for attempt in range(5):
+                await asyncio.sleep(0.3)
+                balance_result = await _get_account_balance(token)
+                if balance_result != pre_balance:
+                    new_balance = balance_result
+                    break
+            
+            # Create annotation
+            try:
+                repo = AIMetaRepository(db)
+                annotation = repo.create_transaction_annotation(
+                    transaction_id=result.get("transaction_id", 0),
+                    account_id=account_id,
+                    merchant_name="External Deposit",
+                    category="Deposit"
+                )
+                logger.info(f"Created deposit annotation: {annotation.annotation_id}")
+            except Exception as e:
+                logger.warning(f"Failed to create annotation: {e}")
+            
+            return TransactionResponse(
+                status="success",
+                transaction_id=result.get("transaction_id"),
+                new_balance=new_balance,
+                message=f"Successfully deposited ${amount_float:,.2f}"
+            )
+        else:
+            return TransactionResponse(
+                status="error",
+                error_message=result.get("error_message", "Deposit failed")
+            )
+            
+    except ValidationError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        logger.error(f"Deposit execution error: {e}")
+        raise HTTPException(status_code=500, detail="Unable to complete deposit")
+
+@app.post("/annotate", response_model=AnnotationResponse)
+async def annotate_transaction(request: AnnotateTransactionRequest,
+                              user_data: Dict[str, str] = Depends(verify_token),
+                              db: Session = Depends(get_db)):
+    """Annotate transaction with merchant and category info"""
+    try:
+        account_id = user_data.get('account_id')
+        
+        if not account_id:
+            raise HTTPException(status_code=400, detail="Account ID not found in token")
+        
+        repo = AIMetaRepository(db)
+        
+        # Normalize merchant name if provided
+        merchant_name = request.merchant_name
+        category = request.category
+        
+        if request.merchant_name:
+            merchant_name = merchant_normalizer.normalize_merchant_name(request.merchant_name)
+            
+            # Get or create merchant
+            merchant = repo.get_or_create_merchant(merchant_name, category)
+            
+            # Auto-categorize if category not provided
+            if not category:
+                category = category_classifier.predict_category(merchant_name, request.amount_cents)
+        
+        # Create annotation
+        annotation = repo.create_transaction_annotation(
+            transaction_id=request.transaction_id,
+            account_id=account_id,
+            merchant_name=merchant_name,
+            category=category,
+            user_note=request.user_note
+        )
+        
+        return AnnotationResponse(
+            status="success",
+            annotation_id=str(annotation.annotation_id),
+            merchant_name=merchant_name,
+            category=category,
+            message="Transaction annotated successfully"
+        )
+        
+    except Exception as e:
+        logger.error(f"Transaction annotation error: {e}")
+        raise HTTPException(status_code=500, detail="Unable to annotate transaction")
+
+async def _get_account_balance(token: str) -> Optional[str]:
+    """Get account balance from core service"""
+    try:
+        url = f"http://{config.balance_api_addr}/balances/current"  # Simplified endpoint
+        headers = {"Authorization": f"Bearer {token}"}
+        
+        response = requests.get(url, headers=headers, timeout=config.backend_timeout)
+        
+        if response.status_code == 200:
+            try:
+                balance_data = response.json()
+                balance = balance_data.get('balance', 0) if isinstance(balance_data, dict) else balance_data
+                balance_dollars = balance / 100 if balance > 10000 else balance
+                return f"${balance_dollars:,.2f}"
+            except:
+                balance = float(response.text.strip())
+                balance_dollars = balance / 100 if balance > 10000 else balance
+                return f"${balance_dollars:,.2f}"
+        
+        return None
+        
+    except Exception as e:
+        logger.error(f"Balance check error: {e}")
+        return None
+
+async def _execute_core_transfer(token: str, from_account: str, to_account: str, amount_cents: int) -> Dict[str, Any]:
+    """Execute transfer via core ledger service"""
+    try:
+        url = f"http://{config.ledger_api_addr}/transactions"
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json"
+        }
+        
+        transaction_id = generate_transaction_id("txn")
+        
+        payload = {
+            "fromAccountNum": from_account,
+            "fromRoutingNum": config.local_routing_num,
+            "toAccountNum": to_account,
+            "toRoutingNum": config.local_routing_num,
+            "amount": amount_cents,
+            "uuid": transaction_id
+        }
+        
+        response = requests.post(url, headers=headers, json=payload, timeout=config.backend_timeout)
+        
+        if response.status_code == 201:
+            return {
+                "status": "success",
+                "transaction_id": transaction_id
+            }
+        elif response.status_code == 402:
+            return {
+                "status": "error",
+                "error_message": "Insufficient funds"
+            }
+        else:
+            return {
+                "status": "error",
+                "error_message": "Transfer service unavailable"
+            }
+            
+    except requests.exceptions.Timeout:
+        return {"status": "error", "error_message": "Transfer service timeout"}
+    except Exception as e:
+        logger.error(f"Core transfer error: {e}")
+        return {"status": "error", "error_message": "Transfer service error"}
+
+async def _execute_core_deposit(token: str, to_account: str, amount_cents: int) -> Dict[str, Any]:
+    """Execute deposit via core ledger service using external funding account"""
+    try:
+        # For now, use a placeholder external account
+        # In practice, this would come from user's linked external accounts
+        external_account = "1111111111"
+        external_routing = "021000021"  # Example external bank routing
+        
+        url = f"http://{config.ledger_api_addr}/transactions"
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json"
+        }
+        
+        transaction_id = generate_transaction_id("deposit")
+        
+        payload = {
+            "fromAccountNum": external_account,
+            "fromRoutingNum": external_routing,
+            "toAccountNum": to_account,
+            "toRoutingNum": config.local_routing_num,
+            "amount": amount_cents,
+            "uuid": transaction_id
+        }
+        
+        response = requests.post(url, headers=headers, json=payload, timeout=config.backend_timeout)
+        
+        if response.status_code == 201:
+            return {
+                "status": "success", 
+                "transaction_id": transaction_id
+            }
+        else:
+            return {
+                "status": "error",
+                "error_message": "Deposit service unavailable"
+            }
+            
+    except Exception as e:
+        logger.error(f"Core deposit error: {e}")
+        return {"status": "error", "error_message": "Deposit service error"}
+
+if __name__ == "__main__":
+    import uvicorn
+    port = int(os.getenv("PORT", "8080"))
+    uvicorn.run(app, host="0.0.0.0", port=port)
+
+# ai-services/transaction-sage/schemas/transaction_execute.py
+"""
+Transaction execution schemas
+"""
+
+from pydantic import BaseModel, Field
+from typing import Optional, Dict, Any
+
+class TransferExecuteRequest(BaseModel):
+    """Request to execute money transfer"""
+    amount: str = Field(..., description="Amount to transfer (e.g., '100.00')")
+    recipient_account: str = Field(..., description="Recipient account number")
+    original_currency: Optional[str] = Field(None, description="Original currency if converted")
+    original_amount: Optional[float] = Field(None, description="Original amount before conversion")
+    note: Optional[str] = Field(None, description="Optional transfer note")
+    metadata: Dict[str, Any] = Field(default_factory=dict, description="Additional metadata")
+
+class DepositExecuteRequest(BaseModel):
+    """Request to execute money deposit"""
+    amount: str = Field(..., description="Amount to deposit (e.g., '500.00')")
+    source_account: Optional[str] = Field(None, description="External source account")
+    original_currency: Optional[str] = Field(None, description="Original currency if converted")
+    original_amount: Optional[float] = Field(None, description="Original amount before conversion")
+    metadata: Dict[str, Any] = Field(default_factory=dict, description="Additional metadata")
+
+class TransactionResponse(BaseModel):
+    """Response from transaction execution"""
+    status: str = Field(..., description="Transaction status: success, error")
+    transaction_id: Optional[str] = Field(None, description="Generated transaction ID")
+    new_balance: Optional[str] = Field(None, description="Updated account balance")
+    message: Optional[str] = Field(None, description="Success message")
+    error_message: Optional[str] = Field(None, description="Error details if failed")
+
+# ai-services/transaction-sage/schemas/annotate_transaction.py
+"""
+Transaction annotation schemas
+"""
+
+from pydantic import BaseModel, Field
+from typing import Optional
+
+class AnnotateTransactionRequest(BaseModel):
+    """Request to annotate transaction"""
+    transaction_id: int = Field(..., description="Transaction ID to annotate")
+    merchant_name: Optional[str] = Field(None, description="Merchant name")
+    category: Optional[str] = Field(None, description="Transaction category")
+    amount_cents: Optional[int] = Field(None, description="Transaction amount for auto-categorization")
+    user_note: Optional[str] = Field(None, description="User note")
+
+class AnnotationResponse(BaseModel):
+    """Response from transaction annotation"""
+    status: str = Field(..., description="Annotation status: success, error")
+    annotation_id: Optional[str] = Field(None, description="Created annotation ID")
+    merchant_name: Optional[str] = Field(None, description="Normalized merchant name")
+    category: Optional[str] = Field(None, description="Assigned category")
+    message: Optional[str] = Field(None, description="Success message")
+    error_message: Optional[str] = Field(None, description="Error details if failed")
+
+# ai-services/transaction-sage/merchant_normalizer.py
+"""
+Merchant name normalization logic
+"""
+
+import re
+import logging
+from typing import Dict, Set
+
+logger = logging.getLogger(__name__)
+
+class MerchantNormalizer:
+    """Normalizes merchant names for consistent categorization"""
+    
+    def __init__(self):
+        # Common merchant patterns and their normalized forms
+        self.merchant_patterns = {
+            r'(?i)amazon.*': 'Amazon',
+            r'(?i)walmart.*': 'Walmart',
+            r'(?i)target.*': 'Target',
+            r'(?i)starbucks.*': 'Starbucks',
+            r'(?i)mcdonalds?.*': 'McDonald\'s',
+            r'(?i)uber.*': 'Uber',
+            r'(?i)netflix.*': 'Netflix',
+            r'(?i)spotify.*': 'Spotify',
+            r'(?i)gas.*station.*': 'Gas Station',
+            r'(?i)grocery.*': 'Grocery Store',
+            r'(?i)pharmacy.*': 'Pharmacy',
+            r'(?i)bank.*fee.*': 'Bank Fee'
+        }
+        
+        # Words to remove from merchant names
+        self.noise_words = {
+            'inc', 'llc', 'corp', 'ltd', 'co', 'company',
+            'store', 'shop', 'market', 'center', 'centre',
+            'payment', 'pay', 'transaction', 'purchase'
+        }
+    
+    def normalize_merchant_name(self, raw_name: str) -> str:
+        """
+        Normalize merchant name to standard form
+        
+        Args:
+            raw_name: Raw merchant name from transaction
+            
+        Returns:
+            Normalized merchant name
+        """
+        if not raw_name:
+            return "Unknown Merchant"
+        
+        # Check against known patterns first
+        for pattern, normalized in self.merchant_patterns.items():
+            if re.match(pattern, raw_name):
+                return normalized
+        
+        # Generic normalization
+        normalized = self._generic_normalize(raw_name)
+        
+        logger.debug(f"Normalized '{raw_name}' -> '{normalized}'")
+        return normalized
+    
+    def _generic_normalize(self, name: str) -> str:
+        """Apply generic normalization rules"""
+        # Convert to lowercase for processing
+        name = name.lower().strip()
+        
+        # Remove special characters and extra spaces
+        name = re.sub(r'[^\w\s]', ' ', name)
+        name = re.sub(r'\s+', ' ', name)
+        
+        # Remove common noise words
+        words = name.split()
+        filtered_words = []
+        
+        for word in words:
+            if word not in self.noise_words and len(word) > 1:
+                filtered_words.append(word)
+        
+        if not filtered_words:
+            return "Unknown Merchant"
+        
+        # Capitalize first letter of each word
+        normalized = ' '.join(word.capitalize() for word in filtered_words)
+        
+        return normalized
+
+# ai-services/transaction-sage/category_model.py
+"""
+Transaction categorization model
+"""
+
+import logging
+from typing import Dict, Optional
+
+logger = logging.getLogger(__name__)
+
+class CategoryClassifier:
+    """Classifies transactions into categories"""
+    
+    def __init__(self):
+        # Merchant to category mappings
+        self.merchant_categories = {
+            'amazon': 'Shopping',
+            'walmart': 'Groceries',
+            'target': 'Shopping',
+            'starbucks': 'Dining',
+            'mcdonalds': 'Dining',
+            'uber': 'Transportation',
+            'netflix': 'Entertainment',
+            'spotify': 'Entertainment',
+            'gas station': 'Transportation',
+            'grocery store': 'Groceries',
+            'pharmacy': 'Health',
+            'bank fee': 'Fees'
+        }
+        
+        # Amount-based category hints
+        self.amount_categories = {
+            'small_purchase': 'Misc',      # < $20
+            'medium_purchase': 'Shopping', # $20-$200
+            'large_purchase': 'Major Purchase',  # > $200
+        }
+    
+    def predict_category(self, merchant_name: str, amount_cents: Optional[int] = None) -> str:
+        """
+        Predict transaction category based on merchant and amount
+        
+        Args:
+            merchant_name: Normalized merchant name
+            amount_cents: Transaction amount in cents
+            
+        Returns:
+            Predicted category
+        """
+        if not merchant_name:
+            return "Uncategorized"
+        
+        # Check merchant-based categories first
+        merchant_lower = merchant_name.lower()
+        
+        for merchant_key, category in self.merchant_categories.items():
+            if merchant_key in merchant_lower:
+                return category
+        
+        # Fall back to amount-based categorization
+        if amount_cents:
+            amount_dollars = amount_cents / 100
+            
+            if amount_dollars < 20:
+                return "Misc"
+            elif amount_dollars < 200:
+                return "Shopping"
+            else:
+                return "Major Purchase"
+        
+        # Default category
+        return "Uncategorized"
+    
+    def get_available_categories(self) -> list[str]:
+        """Get list of available categories"""
+        return [
+            "Groceries", "Dining", "Shopping", "Transportation", 
+            "Entertainment", "Health", "Utilities", "Fees",
+            "Major Purchase", "Transfer", "Deposit", "Misc", "Uncategorized"
+        ]
+
+# ai-services/transaction-sage/config.py
+"""
+Configuration for Transaction-Sage service
+"""
+
+import os
+import base64
+
+class TransactionSageConfig:
+    """Configuration for Transaction-Sage"""
+    
+    def __init__(self):
+        # Core service addresses
+        self.ledger_api_addr = os.getenv('TRANSACTIONS_API_ADDR', 'ledgerwriter:8080')
+        self.balance_api_addr = os.getenv('BALANCES_API_ADDR', 'balancereader:8080')
+        self.contacts_api_addr = os.getenv('CONTACTS_API_ADDR', 'contacts:8080')
+        
+        # Banking settings
+        self.local_routing_num = os.getenv('LOCAL_ROUTING_NUM', '883745000')
+        
+        # Authentication
+        self.jwt_public_key = self._load_public_key()
+        
+        # Service settings
+        self.backend_timeout = int(os.getenv('BACKEND_TIMEOUT', '10'))
+        
+    def _load_public_key(self) -> str:
+        """Load JWT public key"""
+        try:
+            public_key_path = "/tmp/.ssh/publickey"
+            if os.path.exists(public_key_path):
+                with open(public_key_path, 'r') as f:
+                    return f.read()
+            
+            public_key_b64 = os.getenv('JWT_PUBLIC_KEY')
+            if public_key_b64:
+                return base64.b64decode(public_key_b64).decode('utf-8')
+                
+            return None
+        except Exception as e:
+            print(f"Error loading public key: {e}")
+            return None

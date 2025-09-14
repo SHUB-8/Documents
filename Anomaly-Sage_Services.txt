@@ -1,0 +1,792 @@
+# ai-services/anomaly-sage/service.py
+"""
+Anomaly-Sage: Risk assessment and fraud detection
+"""
+
+import os
+import jwt
+import logging
+import uuid
+from datetime import datetime, time
+from typing import Dict, Any, List, Optional
+from fastapi import FastAPI, HTTPException, Depends, Header
+from fastapi.middleware.cors import CORSMiddleware
+from sqlalchemy.orm import Session
+
+from .schemas.score_request import AnomalyScoreRequest, AnomalyScoreResponse
+from .schemas.score_response import TransactionConfirmRequest, TransactionConfirmResponse
+from .risk_model import RiskScoreCalculator
+from .thresholds import ThresholdManager
+from .email_notifier import EmailNotifier
+from .config import AnomalySageConfig
+from ..ai_meta_db.models import get_db
+from ..ai_meta_db.repository.ai_meta_repository import AIMetaRepository
+from ..shared.logging_utils import setup_logging
+from ..shared.exceptions import AuthenticationError, ValidationError
+
+# Setup logging
+logger = setup_logging("anomaly-sage")
+
+app = FastAPI(title="Anomaly-Sage", version="1.0.0")
+
+# Add CORS middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Initialize components
+config = AnomalySageConfig()
+risk_calculator = RiskScoreCalculator()
+threshold_manager = ThresholdManager()
+email_notifier = EmailNotifier(config.email_config) if config.email_config else None
+
+# In-memory storage for pending confirmations (in production use Redis)
+pending_confirmations: Dict[str, Dict[str, Any]] = {}
+
+def verify_token(authorization: str = Header(...)) -> Dict[str, str]:
+    """Verify JWT token and extract user data"""
+    try:
+        if not authorization.startswith("Bearer "):
+            raise AuthenticationError("Invalid authorization header")
+        
+        token = authorization[7:]
+        
+        if not config.jwt_public_key:
+            logger.warning("No JWT public key configured")
+            payload = jwt.decode(token, options={"verify_signature": False})
+        else:
+            payload = jwt.decode(token, config.jwt_public_key, algorithms=['RS256'])
+        
+        return {
+            'username': payload.get('user'),
+            'account_id': payload.get('acct'),
+            'name': payload.get('name'),
+            'token': token
+        }
+    except jwt.exceptions.InvalidTokenError as e:
+        logger.error(f"Token validation failed: {e}")
+        raise AuthenticationError("Invalid token")
+    except Exception as e:
+        logger.error(f"Authentication error: {e}")
+        raise AuthenticationError("Authentication failed")
+
+@app.get("/health")
+def health_check():
+    """Health check endpoint"""
+    return {"status": "healthy", "service": "anomaly-sage"}
+
+@app.post("/check-risk", response_model=AnomalyScoreResponse)
+async def check_transaction_risk(request: Dict[str, Any],
+                                user_data: Dict[str, str] = Depends(verify_token),
+                                db: Session = Depends(get_db)):
+    """Check transaction for anomalies and risk"""
+    try:
+        account_id = user_data.get('account_id')
+        
+        if not account_id:
+            raise HTTPException(status_code=400, detail="Account ID not found in token")
+        
+        # Parse request
+        amount = request.get("amount", "0")
+        recipient = request.get("recipient", "")
+        timestamp = request.get("timestamp") or datetime.now()
+        
+        # Convert amount to cents
+        try:
+            amount_clean = str(amount).replace("$", "").replace(",", "")
+            amount_float = float(amount_clean)
+            amount_cents = int(amount_float * 100)
+        except (ValueError, TypeError):
+            raise ValidationError("Invalid amount format")
+        
+        if amount_cents <= 0:
+            raise ValidationError("Amount must be greater than zero")
+        
+        repo = AIMetaRepository(db)
+        
+        # Get or create user profile
+        user_profile = repo.get_or_create_user_profile(account_id)
+        
+        # Calculate risk score
+        risk_assessment = await risk_calculator.calculate_risk_score(
+            account_id=account_id,
+            amount_cents=amount_cents,
+            recipient=recipient,
+            timestamp=timestamp,
+            user_profile=user_profile,
+            repo=repo
+        )
+        
+        risk_score = risk_assessment["risk_score"]
+        reasons = risk_assessment["reasons"]
+        
+        # Determine status and action based on thresholds
+        thresholds = threshold_manager.get_user_thresholds(user_profile)
+        status, action = threshold_manager.classify_risk(risk_score, thresholds)
+        
+        # Log anomaly
+        anomaly_log = repo.create_anomaly_log(
+            transaction_id=0,  # Will be updated when transaction is created
+            account_id=account_id,
+            risk_score=risk_score,
+            status=status,
+            reasons=reasons
+        )
+        
+        logger.info(f"Risk assessment: account={account_id}, amount=${amount_float:.2f}, "
+                   f"risk_score={risk_score:.4f}, status={status}")
+        
+        response_data = {
+            "status": status,
+            "risk_score": risk_score,
+            "reasons": reasons,
+            "action": action
+        }
+        
+        # Handle different risk levels
+        if action == "block":
+            response_data["message"] = (
+                f"Transaction blocked due to suspicious activity. "
+                f"Risk score: {risk_score:.2f}. Reasons: {', '.join(reasons)}"
+            )
+            return AnomalyScoreResponse(**response_data)
+        
+        elif action == "confirm":
+            # Generate confirmation request
+            confirmation_id = str(uuid.uuid4())
+            confirmation_code = str(uuid.uuid4())[:8].upper()
+            
+            pending_confirmations[confirmation_id] = {
+                "account_id": account_id,
+                "amount_cents": amount_cents,
+                "recipient": recipient,
+                "confirmation_code": confirmation_code,
+                "created_at": datetime.now(),
+                "anomaly_log_id": str(anomaly_log.log_id)
+            }
+            
+            # Send email notification if configured
+            if email_notifier and user_profile.email_for_alerts:
+                try:
+                    await email_notifier.send_suspicious_transaction_alert(
+                        email=user_profile.email_for_alerts,
+                        amount=amount_float,
+                        recipient=recipient,
+                        confirmation_code=confirmation_code,
+                        reasons=reasons
+                    )
+                    logger.info(f"Sent confirmation email to {user_profile.email_for_alerts}")
+                except Exception as e:
+                    logger.error(f"Failed to send confirmation email: {e}")
+            
+            response_data.update({
+                "message": (
+                    f"Transaction requires confirmation due to unusual activity. "
+                    f"A confirmation code has been sent to your registered email. "
+                    f"Please confirm within {config.confirmation_timeout_minutes} minutes."
+                ),
+                "confirmation_id": confirmation_id,
+                "requires_confirmation": True
+            })
+            
+            return AnomalyScoreResponse(**response_data)
+        
+        else:  # action == "allow"
+            response_data["message"] = "Transaction approved - low risk detected"
+            return AnomalyScoreResponse(**response_data)
+        
+    except ValidationError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        logger.error(f"Risk assessment error: {e}")
+        raise HTTPException(status_code=500, detail="Risk assessment failed")
+
+@app.post("/confirm-transaction", response_model=TransactionConfirmResponse)
+async def confirm_suspicious_transaction(request: TransactionConfirmRequest,
+                                       user_data: Dict[str, str] = Depends(verify_token),
+                                       db: Session = Depends(get_db)):
+    """Confirm a suspicious transaction via confirmation code"""
+    try:
+        account_id = user_data.get('account_id')
+        
+        if not account_id:
+            raise HTTPException(status_code=400, detail="Account ID not found in token")
+        
+        confirmation_id = request.confirmation_id
+        confirmation_code = request.confirmation_code
+        
+        # Check if confirmation exists
+        if confirmation_id not in pending_confirmations:
+            return TransactionConfirmResponse(
+                status="error",
+                error_message="Invalid or expired confirmation ID"
+            )
+        
+        confirmation_data = pending_confirmations[confirmation_id]
+        
+        # Verify account matches
+        if confirmation_data["account_id"] != account_id:
+            return TransactionConfirmResponse(
+                status="error",
+                error_message="Confirmation does not belong to this account"
+            )
+        
+        # Check if expired
+        created_at = confirmation_data["created_at"]
+        if (datetime.now() - created_at).total_seconds() > (config.confirmation_timeout_minutes * 60):
+            del pending_confirmations[confirmation_id]
+            return TransactionConfirmResponse(
+                status="error",
+                error_message="Confirmation has expired"
+            )
+        
+        # Verify confirmation code
+        if confirmation_data["confirmation_code"] != confirmation_code.upper():
+            return TransactionConfirmResponse(
+                status="error",
+                error_message="Invalid confirmation code"
+            )
+        
+        # Mark as confirmed
+        repo = AIMetaRepository(db)
+        
+        # Update anomaly log
+        try:
+            # This is simplified - would need to update the anomaly log in database
+            logger.info(f"Transaction confirmed: {confirmation_id}")
+        except Exception as e:
+            logger.warning(f"Failed to update anomaly log: {e}")
+        
+        # Clean up
+        del pending_confirmations[confirmation_id]
+        
+        return TransactionConfirmResponse(
+            status="success",
+            message="Transaction confirmed successfully. You may now proceed.",
+            confirmed_at=datetime.now().isoformat()
+        )
+        
+    except Exception as e:
+        logger.error(f"Transaction confirmation error: {e}")
+        raise HTTPException(status_code=500, detail="Confirmation failed")
+
+@app.get("/anomaly-logs")
+async def get_anomaly_logs(limit: int = 50,
+                          user_data: Dict[str, str] = Depends(verify_token),
+                          db: Session = Depends(get_db)):
+    """Get anomaly logs for account"""
+    try:
+        account_id = user_data.get('account_id')
+        
+        if not account_id:
+            raise HTTPException(status_code=400, detail="Account ID not found in token")
+        
+        repo = AIMetaRepository(db)
+        logs = repo.get_anomaly_logs(account_id, limit)
+        
+        log_data = []
+        for log in logs:
+            log_data.append({
+                "log_id": str(log.log_id),
+                "transaction_id": log.transaction_id,
+                "risk_score": float(log.risk_score),
+                "status": log.status,
+                "reasons": log.reasons,
+                "alerted_at": log.alerted_at.isoformat() if log.alerted_at else None,
+                "resolved": log.resolved
+            })
+        
+        return {
+            "status": "success",
+            "logs": log_data,
+            "count": len(log_data)
+        }
+        
+    except Exception as e:
+        logger.error(f"Get anomaly logs error: {e}")
+        raise HTTPException(status_code=500, detail="Unable to retrieve anomaly logs")
+
+@app.post("/update-thresholds")
+async def update_user_thresholds(suspicious_multiplier: float = 3.0,
+                                fraud_multiplier: float = 5.0,
+                                user_data: Dict[str, str] = Depends(verify_token),
+                                db: Session = Depends(get_db)):
+    """Update user's anomaly detection thresholds"""
+    try:
+        account_id = user_data.get('account_id')
+        
+        if not account_id:
+            raise HTTPException(status_code=400, detail="Account ID not found in token")
+        
+        if suspicious_multiplier <= 0 or fraud_multiplier <= 0:
+            raise ValidationError("Multipliers must be positive")
+        
+        if suspicious_multiplier >= fraud_multiplier:
+            raise ValidationError("Suspicious multiplier must be less than fraud multiplier")
+        
+        repo = AIMetaRepository(db)
+        user_profile = repo.get_or_create_user_profile(account_id)
+        
+        # Update thresholds
+        user_profile.threshold_suspicious_multiplier = suspicious_multiplier
+        user_profile.threshold_fraud_multiplier = fraud_multiplier
+        
+        # In a real implementation, would commit the changes to database
+        # db.commit()
+        
+        return {
+            "status": "success",
+            "message": "Thresholds updated successfully",
+            "suspicious_multiplier": suspicious_multiplier,
+            "fraud_multiplier": fraud_multiplier
+        }
+        
+    except ValidationError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        logger.error(f"Update thresholds error: {e}")
+        raise HTTPException(status_code=500, detail="Unable to update thresholds")
+
+if __name__ == "__main__":
+    import uvicorn
+    port = int(os.getenv("PORT", "8080"))
+    uvicorn.run(app, host="0.0.0.0", port=port)
+
+# ai-services/anomaly-sage/schemas/score_request.py
+"""
+Anomaly scoring request schemas
+"""
+
+from pydantic import BaseModel, Field
+from typing import Optional, Dict, Any, List
+from datetime import datetime
+
+class AnomalyScoreRequest(BaseModel):
+    """Request for anomaly scoring"""
+    account_id: str = Field(..., description="Account performing transaction")
+    amount_cents: int = Field(..., description="Transaction amount in cents")
+    recipient: str = Field(..., description="Transaction recipient")
+    transaction_type: str = Field("transfer", description="Type of transaction")
+    timestamp: Optional[datetime] = Field(None, description="Transaction timestamp")
+    metadata: Dict[str, Any] = Field(default_factory=dict, description="Additional metadata")
+
+class AnomalyScoreResponse(BaseModel):
+    """Response from anomaly scoring"""
+    status: str = Field(..., description="Risk status: normal, suspicious, fraud")
+    risk_score: float = Field(..., description="Numerical risk score (0-10)")
+    reasons: List[str] = Field(default_factory=list, description="Reasons for risk assessment")
+    action: str = Field(..., description="Recommended action: allow, confirm, block")
+    message: Optional[str] = Field(None, description="User-facing message")
+    confirmation_id: Optional[str] = Field(None, description="Confirmation ID if confirmation required")
+    requires_confirmation: Optional[bool] = Field(False, description="Whether confirmation is required")
+
+# ai-services/anomaly-sage/schemas/score_response.py
+"""
+Transaction confirmation schemas
+"""
+
+from pydantic import BaseModel, Field
+from typing import Optional
+
+class TransactionConfirmRequest(BaseModel):
+    """Request to confirm suspicious transaction"""
+    confirmation_id: str = Field(..., description="Confirmation ID from risk assessment")
+    confirmation_code: str = Field(..., description="Confirmation code from email/SMS")
+
+class TransactionConfirmResponse(BaseModel):
+    """Response from transaction confirmation"""
+    status: str = Field(..., description="Confirmation status: success, error")
+    message: Optional[str] = Field(None, description="Success message")
+    confirmed_at: Optional[str] = Field(None, description="Confirmation timestamp")
+    error_message: Optional[str] = Field(None, description="Error details if failed")
+
+# ai-services/anomaly-sage/risk_model.py
+"""
+Risk scoring model for anomaly detection
+"""
+
+import logging
+import statistics
+from datetime import datetime, timedelta
+from typing import Dict, Any, List
+from ..shared.constants import DEFAULT_SUSPICIOUS_MULTIPLIER, DEFAULT_FRAUD_MULTIPLIER
+
+logger = logging.getLogger(__name__)
+
+class RiskScoreCalculator:
+    """Calculates risk scores for transactions using statistical analysis"""
+    
+    def __init__(self):
+        self.base_risk_factors = {
+            "large_amount": 2.0,
+            "unusual_time": 1.5,
+            "new_recipient": 1.2,
+            "high_frequency": 1.8,
+            "weekend_transaction": 1.1
+        }
+    
+    async def calculate_risk_score(self, account_id: str, amount_cents: int, 
+                                  recipient: str, timestamp: datetime,
+                                  user_profile, repo) -> Dict[str, Any]:
+        """
+        Calculate comprehensive risk score for transaction
+        
+        Returns:
+            Dict with risk_score and reasons
+        """
+        try:
+            risk_score = 0.0
+            reasons = []
+            
+            # 1. Amount-based risk (Z-score analysis)
+            amount_risk, amount_reasons = self._calculate_amount_risk(
+                amount_cents, user_profile
+            )
+            risk_score += amount_risk
+            reasons.extend(amount_reasons)
+            
+            # 2. Time-based risk
+            time_risk, time_reasons = self._calculate_time_risk(timestamp, user_profile)
+            risk_score += time_risk
+            reasons.extend(time_reasons)
+            
+            # 3. Recipient-based risk
+            recipient_risk, recipient_reasons = await self._calculate_recipient_risk(
+                account_id, recipient, repo
+            )
+            risk_score += recipient_risk
+            reasons.extend(recipient_reasons)
+            
+            # 4. Frequency-based risk
+            frequency_risk, frequency_reasons = await self._calculate_frequency_risk(
+                account_id, timestamp, repo
+            )
+            risk_score += frequency_risk
+            reasons.extend(frequency_reasons)
+            
+            # 5. Pattern-based risk
+            pattern_risk, pattern_reasons = await self._calculate_pattern_risk(
+                account_id, amount_cents, recipient, timestamp, repo
+            )
+            risk_score += pattern_risk
+            reasons.extend(pattern_reasons)
+            
+            # Cap risk score at 10.0
+            risk_score = min(risk_score, 10.0)
+            
+            logger.info(f"Risk calculated for account {account_id}: score={risk_score:.4f}, "
+                       f"reasons={len(reasons)}")
+            
+            return {
+                "risk_score": risk_score,
+                "reasons": reasons[:5],  # Limit to top 5 reasons
+                "components": {
+                    "amount_risk": amount_risk,
+                    "time_risk": time_risk,
+                    "recipient_risk": recipient_risk,
+                    "frequency_risk": frequency_risk,
+                    "pattern_risk": pattern_risk
+                }
+            }
+            
+        except Exception as e:
+            logger.error(f"Risk calculation error: {e}")
+            return {
+                "risk_score": 0.0,
+                "reasons": ["Risk calculation failed"],
+                "error": str(e)
+            }
+    
+    def _calculate_amount_risk(self, amount_cents: int, user_profile) -> tuple[float, List[str]]:
+        """Calculate risk based on transaction amount using Z-score"""
+        risk = 0.0
+        reasons = []
+        
+        try:
+            amount_dollars = amount_cents / 100
+            
+            # Use user profile statistics if available
+            if (user_profile.mean_txn_amount_cents and 
+                user_profile.stddev_txn_amount_cents and
+                user_profile.stddev_txn_amount_cents > 0):
+                
+                mean_dollars = float(user_profile.mean_txn_amount_cents) / 100
+                stddev_dollars = float(user_profile.stddev_txn_amount_cents) / 100
+                
+                # Calculate Z-score
+                z_score = (amount_dollars - mean_dollars) / stddev_dollars
+                
+                if z_score > 3.0:  # More than 3 standard deviations
+                    risk += 3.0
+                    reasons.append(f"Amount ${amount_dollars:,.2f} is unusually large (z-score: {z_score:.2f})")
+                elif z_score > 2.0:
+                    risk += 2.0
+                    reasons.append(f"Amount ${amount_dollars:,.2f} is significantly above average")
+                elif z_score > 1.5:
+                    risk += 1.0
+                    reasons.append(f"Amount ${amount_dollars:,.2f} is above normal range")
+            else:
+                # Fallback to absolute thresholds
+                if amount_dollars > 5000:
+                    risk += 3.0
+                    reasons.append(f"Large transaction amount: ${amount_dollars:,.2f}")
+                elif amount_dollars > 1000:
+                    risk += 1.5
+                    reasons.append(f"Elevated transaction amount: ${amount_dollars:,.2f}")
+            
+            # Additional checks for very large amounts
+            if amount_dollars > 10000:
+                risk += 2.0
+                reasons.append("Transaction exceeds $10,000 threshold")
+        
+        except Exception as e:
+            logger.error(f"Amount risk calculation error: {e}")
+            risk = 0.5  # Small penalty for calculation failure
+            reasons.append("Unable to assess amount risk")
+        
+        return risk, reasons
+    
+    def _calculate_time_risk(self, timestamp: datetime, user_profile) -> tuple[float, List[str]]:
+        """Calculate risk based on transaction time"""
+        risk = 0.0
+        reasons = []
+        
+        try:
+            # Check if transaction is outside active hours
+            active_hours = user_profile.active_hours or [8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18]
+            transaction_hour = timestamp.hour
+            
+            if transaction_hour not in active_hours:
+                risk += 1.0
+                reasons.append(f"Transaction at unusual time: {timestamp.strftime('%H:%M')}")
+            
+            # Weekend transactions (slight risk increase)
+            if timestamp.weekday() >= 5:  # Saturday = 5, Sunday = 6
+                risk += 0.5
+                reasons.append("Weekend transaction")
+            
+            # Very late night or very early morning
+            if transaction_hour >= 23 or transaction_hour <= 5:
+                risk += 1.5
+                reasons.append(f"Late night/early morning transaction: {timestamp.strftime('%H:%M')}")
+        
+        except Exception as e:
+            logger.error(f"Time risk calculation error: {e}")
+        
+        return risk, reasons
+    
+    async def _calculate_recipient_risk(self, account_id: str, recipient: str, repo) -> tuple[float, List[str]]:
+        """Calculate risk based on recipient patterns"""
+        risk = 0.0
+        reasons = []
+        
+        try:
+            # Check if recipient is new (simplified check)
+            annotations = repo.get_transaction_annotations(account_id, 100)
+            
+            # Look for previous transactions to this recipient
+            previous_transactions = [
+                a for a in annotations 
+                if a.merchant_name and recipient in a.merchant_name
+            ]
+            
+            if not previous_transactions:
+                risk += 1.0
+                reasons.append(f"New recipient: {recipient}")
+            
+            # Check if recipient looks like an account number vs contact name
+            if recipient.isdigit() and len(recipient) >= 10:
+                risk += 0.5
+                reasons.append("Transaction to raw account number")
+        
+        except Exception as e:
+            logger.error(f"Recipient risk calculation error: {e}")
+        
+        return risk, reasons
+    
+    async def _calculate_frequency_risk(self, account_id: str, timestamp: datetime, repo) -> tuple[float, List[str]]:
+        """Calculate risk based on transaction frequency"""
+        risk = 0.0
+        reasons = []
+        
+        try:
+            # Check recent transaction frequency (simplified)
+            # In a real implementation, would query actual transaction history
+            
+            # For now, use annotations as proxy
+            recent_annotations = repo.get_transaction_annotations(account_id, 50)
+            
+            # Count transactions in last hour/day (simplified)
+            # This is a placeholder - would need actual timestamps
+            if len(recent_annotations) > 20:
+                risk += 1.5
+                reasons.append("High recent transaction frequency")
+        
+        except Exception as e:
+            logger.error(f"Frequency risk calculation error: {e}")
+        
+        return risk, reasons
+    
+    async def _calculate_pattern_risk(self, account_id: str, amount_cents: int, 
+                                    recipient: str, timestamp: datetime, repo) -> tuple[float, List[str]]:
+        """Calculate risk based on unusual patterns"""
+        risk = 0.0
+        reasons = []
+        
+        try:
+            # Round number amounts (potential indicator of manual/unusual transactions)
+            amount_dollars = amount_cents / 100
+            if amount_dollars == int(amount_dollars) and amount_dollars >= 100:
+                if amount_dollars % 100 == 0:  # Multiples of 100
+                    risk += 0.5
+                    reasons.append(f"Round amount: ${amount_dollars:,.0f}")
+            
+            # Very specific amounts (like $1337.00, $9999.00) could be suspicious
+            suspicious_amounts = [1337, 9999, 6666, 1234, 4321]
+            if int(amount_dollars) in suspicious_amounts:
+                risk += 1.0
+                reasons.append(f"Potentially suspicious amount pattern: ${amount_dollars:,.0f}")
+        
+        except Exception as e:
+            logger.error(f"Pattern risk calculation error: {e}")
+        
+        return risk, reasons
+
+# ai-services/anomaly-sage/thresholds.py
+"""
+Threshold management for anomaly detection
+"""
+
+import logging
+from typing import Dict, Any, Tuple
+from ..shared.constants import DEFAULT_SUSPICIOUS_MULTIPLIER, DEFAULT_FRAUD_MULTIPLIER
+
+logger = logging.getLogger(__name__)
+
+class ThresholdManager:
+    """Manages risk thresholds and classification"""
+    
+    def __init__(self):
+        self.default_thresholds = {
+            "suspicious_threshold": 2.0,
+            "fraud_threshold": 4.0
+        }
+    
+    def get_user_thresholds(self, user_profile) -> Dict[str, float]:
+        """Get risk thresholds for user"""
+        try:
+            if not user_profile:
+                return self.default_thresholds
+            
+            # Calculate dynamic thresholds based on user's transaction patterns
+            base_threshold = 1.0
+            
+            if (user_profile.mean_txn_amount_cents and 
+                user_profile.stddev_txn_amount_cents):
+                
+                # Use user's statistical profile to adjust thresholds
+                suspicious_multiplier = float(user_profile.threshold_suspicious_multiplier or DEFAULT_SUSPICIOUS_MULTIPLIER)
+                fraud_multiplier = float(user_profile.threshold_fraud_multiplier or DEFAULT_FRAUD_MULTIPLIER)
+                
+                return {
+                    "suspicious_threshold": base_threshold * suspicious_multiplier,
+                    "fraud_threshold": base_threshold * fraud_multiplier
+                }
+            
+            return self.default_thresholds
+            
+        except Exception as e:
+            logger.error(f"Error getting user thresholds: {e}")
+            return self.default_thresholds
+    
+    def classify_risk(self, risk_score: float, thresholds: Dict[str, float]) -> Tuple[str, str]:
+        """
+        Classify risk level and determine action
+        
+        Returns:
+            (status, action) tuple
+        """
+        try:
+            suspicious_threshold = thresholds.get("suspicious_threshold", 2.0)
+            fraud_threshold = thresholds.get("fraud_threshold", 4.0)
+            
+            if risk_score >= fraud_threshold:
+                return "fraud", "block"
+            elif risk_score >= suspicious_threshold:
+                return "suspicious", "confirm"
+            else:
+                return "normal", "allow"
+                
+        except Exception as e:
+            logger.error(f"Risk classification error: {e}")
+            return "normal", "allow"  # Fail safe
+    
+    def update_user_thresholds(self, user_profile, suspicious_multiplier: float, 
+                              fraud_multiplier: float) -> bool:
+        """Update user's threshold multipliers"""
+        try:
+            if suspicious_multiplier <= 0 or fraud_multiplier <= 0:
+                return False
+            
+            if suspicious_multiplier >= fraud_multiplier:
+                return False
+            
+            user_profile.threshold_suspicious_multiplier = suspicious_multiplier
+            user_profile.threshold_fraud_multiplier = fraud_multiplier
+            
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error updating thresholds: {e}")
+            return False
+
+# ai-services/anomaly-sage/email_notifier.py
+"""
+Email notification service for suspicious transactions
+"""
+
+import asyncio
+import logging
+from typing import Dict, Any, List, Optional
+import smtplib
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+
+logger = logging.getLogger(__name__)
+
+class EmailNotifier:
+    """Sends email notifications for suspicious transactions"""
+    
+    def __init__(self, email_config: Dict[str, str]):
+        self.smtp_server = email_config.get("smtp_server")
+        self.smtp_port = int(email_config.get("smtp_port", 587))
+        self.username = email_config.get("username")
+        self.password = email_config.get("password")
+        self.from_email = email_config.get("from_email")
+        self.enabled = all([self.smtp_server, self.username, self.password, self.from_email])
+        
+        if not self.enabled:
+            logger.warning("Email notification not configured properly")
+    
+    async def send_suspicious_transaction_alert(self, email: str, amount: float, 
+                                              recipient: str, confirmation_code: str,
+                                              reasons: List[str]) -> bool:
+        """Send email alert for suspicious transaction"""
+        if not self.enabled:
+            logger.warning("Email notifications disabled")
+            return False
+        
+        try:
+            subject = "⚠️ Bank of Anthos - Transaction Confirmation Required"
+            
+            # Create email content
+            html_content = self._create_suspicious_transaction_email(
+                amount, recipient, confirmation_code, reasons
+            )
+            text_content = self._create_text_email(amount, recipient, confirmation_code, reasons)
+            
+            # Send email

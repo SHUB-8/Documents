@@ -1,0 +1,390 @@
+# ai-services/contact-sage/service.py
+"""
+Contact-Sage: Manages contact operations and resolution
+"""
+
+import os
+import re
+import jwt
+import logging
+import requests
+from typing import Dict, Any, List, Optional
+from fastapi import FastAPI, HTTPException, Depends, Header
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+
+from .schemas.resolve_contact import ContactResolutionRequest, ContactResolutionResponse
+from .schemas.add_contact import AddContactRequest, AddContactResponse
+from .client_interface import CoreContactsClient
+from .config import ContactSageConfig
+from ..shared.logging_utils import setup_logging
+from ..shared.exceptions import AuthenticationError, ContactNotFoundError
+
+# Setup logging
+logger = setup_logging("contact-sage")
+
+app = FastAPI(title="Contact-Sage", version="1.0.0")
+
+# Add CORS middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Initialize configuration and clients
+config = ContactSageConfig()
+contacts_client = CoreContactsClient(config.contacts_api_addr, config.backend_timeout)
+
+def verify_token(authorization: str = Header(...)) -> Dict[str, str]:
+    """Verify JWT token and extract user data"""
+    try:
+        if not authorization.startswith("Bearer "):
+            raise AuthenticationError("Invalid authorization header")
+        
+        token = authorization[7:]  # Remove "Bearer " prefix
+        
+        if not config.jwt_public_key:
+            logger.warning("No JWT public key configured - skipping verification")
+            # For development, decode without verification
+            payload = jwt.decode(token, options={"verify_signature": False})
+        else:
+            payload = jwt.decode(token, config.jwt_public_key, algorithms=['RS256'])
+        
+        return {
+            'username': payload.get('user'),
+            'account_id': payload.get('acct'),
+            'name': payload.get('name')
+        }
+    except jwt.exceptions.InvalidTokenError as e:
+        logger.error(f"Token validation failed: {e}")
+        raise AuthenticationError("Invalid token")
+    except Exception as e:
+        logger.error(f"Authentication error: {e}")
+        raise AuthenticationError("Authentication failed")
+
+@app.get("/health")
+def health_check():
+    """Health check endpoint"""
+    return {"status": "healthy", "service": "contact-sage"}
+
+@app.get("/contacts")
+async def get_contacts(limit: Optional[int] = None, 
+                      user_data: Dict[str, str] = Depends(verify_token)):
+    """Get user contacts"""
+    try:
+        username = user_data.get('username')
+        if not username:
+            raise HTTPException(status_code=400, detail="Username not found in token")
+        
+        result = await contacts_client.get_contacts(username, limit)
+        
+        if result.get("status") == "error":
+            raise HTTPException(status_code=500, detail=result.get("error_message"))
+        
+        return result
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Get contacts error: {e}")
+        raise HTTPException(status_code=500, detail="Unable to retrieve contacts")
+
+@app.get("/contacts/{contact_name}")
+async def get_contact_details(contact_name: str,
+                             user_data: Dict[str, str] = Depends(verify_token)):
+    """Get details for specific contact"""
+    try:
+        username = user_data.get('username')
+        if not username:
+            raise HTTPException(status_code=400, detail="Username not found in token")
+        
+        result = await contacts_client.get_contact_by_name(username, contact_name)
+        
+        if result.get("status") == "error":
+            raise HTTPException(status_code=404, detail=f"Contact '{contact_name}' not found")
+        
+        return result
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Get contact details error: {e}")
+        raise HTTPException(status_code=500, detail="Unable to retrieve contact details")
+
+@app.post("/contacts/resolve", response_model=ContactResolutionResponse)
+async def resolve_contact(request: ContactResolutionRequest,
+                         user_data: Dict[str, str] = Depends(verify_token)):
+    """Resolve contact name to account ID"""
+    try:
+        username = user_data.get('username')
+        if not username:
+            raise HTTPException(status_code=400, detail="Username not found in token")
+        
+        recipient = request.recipient.strip()
+        
+        # Check if it's already a valid account number
+        if re.match(r'^\d{10}$', recipient):
+            return ContactResolutionResponse(
+                status="success",
+                account_id=recipient,
+                contact_name=None,
+                confidence=1.0
+            )
+        
+        # Look up in contacts
+        contacts_result = await contacts_client.get_contacts(username)
+        
+        if contacts_result.get("status") != "success":
+            return ContactResolutionResponse(
+                status="error",
+                error_message="Unable to access contacts"
+            )
+        
+        contacts = contacts_result.get("contacts", [])
+        
+        # Try exact match first (case-insensitive)
+        for contact in contacts:
+            contact_name = contact.get("label", "")
+            if recipient.lower() == contact_name.lower():
+                return ContactResolutionResponse(
+                    status="success",
+                    account_id=contact.get("account_id") or contact.get("account_num"),
+                    contact_name=contact_name,
+                    confidence=1.0
+                )
+        
+        # Try partial match if fuzzy matching is enabled
+        if request.fuzzy_match:
+            suggestions = []
+            for contact in contacts:
+                contact_name = contact.get("label", "")
+                if recipient.lower() in contact_name.lower():
+                    suggestions.append(contact_name)
+                    if len(suggestions) == 1:  # Return first partial match
+                        return ContactResolutionResponse(
+                            status="success",
+                            account_id=contact.get("account_id") or contact.get("account_num"),
+                            contact_name=contact_name,
+                            confidence=0.7
+                        )
+            
+            if suggestions:
+                return ContactResolutionResponse(
+                    status="multiple_matches",
+                    suggestions=suggestions[:5]  # Limit suggestions
+                )
+        
+        # No matches found
+        available_contacts = [c.get("label", "") for c in contacts if c.get("label")]
+        return ContactResolutionResponse(
+            status="not_found",
+            error_message=f"Contact '{recipient}' not found",
+            suggestions=available_contacts[:5]
+        )
+        
+    except Exception as e:
+        logger.error(f"Contact resolution error: {e}")
+        return ContactResolutionResponse(
+            status="error",
+            error_message="Contact resolution failed"
+        )
+
+@app.post("/contacts", response_model=AddContactResponse)
+async def add_contact(request: AddContactRequest,
+                     user_data: Dict[str, str] = Depends(verify_token)):
+    """Add new contact (future enhancement)"""
+    # This would integrate with the core contacts service to add new contacts
+    # For now, return not implemented
+    return AddContactResponse(
+        status="error",
+        error_message="Adding contacts not yet implemented"
+    )
+
+if __name__ == "__main__":
+    import uvicorn
+    port = int(os.getenv("PORT", "8080"))
+    uvicorn.run(app, host="0.0.0.0", port=port)
+
+# ai-services/contact-sage/schemas/resolve_contact.py
+"""
+Contact resolution schemas
+"""
+
+from pydantic import BaseModel, Field
+from typing import Optional, List
+
+class ContactResolutionRequest(BaseModel):
+    """Request to resolve contact name to account"""
+    recipient: str = Field(..., description="Contact name or account number to resolve")
+    fuzzy_match: bool = Field(True, description="Allow fuzzy matching of contact names")
+
+class ContactResolutionResponse(BaseModel):
+    """Response from contact resolution"""
+    status: str = Field(..., description="Resolution status: success, not_found, multiple_matches, error")
+    account_id: Optional[str] = Field(None, description="Resolved account ID")
+    contact_name: Optional[str] = Field(None, description="Matched contact name")
+    confidence: Optional[float] = Field(None, description="Match confidence score")
+    suggestions: List[str] = Field(default_factory=list, description="Alternative contact suggestions")
+    error_message: Optional[str] = Field(None, description="Error details if failed")
+
+# ai-services/contact-sage/schemas/add_contact.py
+"""
+Add contact schemas
+"""
+
+from pydantic import BaseModel, Field
+from typing import Optional
+
+class AddContactRequest(BaseModel):
+    """Request to add new contact"""
+    label: str = Field(..., description="Contact display name")
+    account_id: str = Field(..., description="Contact account ID")
+    routing_num: Optional[str] = Field(None, description="Contact routing number")
+    is_external: bool = Field(False, description="Whether contact is external bank")
+
+class AddContactResponse(BaseModel):
+    """Response from adding contact"""
+    status: str = Field(..., description="Add status: success, error")
+    contact_id: Optional[str] = Field(None, description="ID of created contact")
+    message: Optional[str] = Field(None, description="Success message")
+    error_message: Optional[str] = Field(None, description="Error details if failed")
+
+# ai-services/contact-sage/client_interface.py
+"""
+Interface to core Bank-of-Anthos contacts service
+"""
+
+import requests
+import logging
+from typing import Dict, Any, Optional, List
+
+logger = logging.getLogger(__name__)
+
+class CoreContactsClient:
+    """Client for core Bank-of-Anthos contacts service"""
+    
+    def __init__(self, service_addr: str, timeout: int = 10):
+        self.service_addr = service_addr
+        self.timeout = timeout
+        self.base_url = f"http://{service_addr}"
+    
+    async def get_contacts(self, username: str, limit: Optional[int] = None) -> Dict[str, Any]:
+        """Get contacts from core service"""
+        try:
+            url = f"{self.base_url}/contacts/{username}"
+            
+            response = requests.get(url, timeout=self.timeout)
+            
+            if response.status_code == 200:
+                contacts = response.json()
+                
+                if limit and isinstance(contacts, list):
+                    contacts = contacts[:limit]
+                
+                # Format contacts list for user display
+                if contacts:
+                    contact_list = []
+                    for contact in contacts:
+                        label = contact.get('label', 'Unknown')
+                        account = contact.get('account_id') or contact.get('account_num', 'N/A')
+                        is_external = contact.get('is_external', False)
+                        
+                        if is_external:
+                            contact_list.append(f"• {label} ({account}) [External]")
+                        else:
+                            contact_list.append(f"• {label} ({account})")
+                    
+                    contacts_text = "Your contacts:\n" + "\n".join(contact_list)
+                    return {
+                        "status": "success",
+                        "contacts_list": contacts_text,
+                        "contacts": contacts
+                    }
+                else:
+                    return {
+                        "status": "success",
+                        "contacts_list": "You have no contacts saved.",
+                        "contacts": []
+                    }
+            else:
+                logger.error(f"Contacts service error: {response.status_code}")
+                return {
+                    "status": "error",
+                    "error_message": "Unable to retrieve contacts"
+                }
+                
+        except requests.exceptions.Timeout:
+            return {"status": "error", "error_message": "Contacts service timeout"}
+        except Exception as e:
+            logger.error(f"Contacts service error: {e}")
+            return {"status": "error", "error_message": "Contacts service unavailable"}
+    
+    async def get_contact_by_name(self, username: str, contact_name: str) -> Dict[str, Any]:
+        """Get specific contact by name"""
+        try:
+            # First get all contacts, then filter
+            contacts_result = await self.get_contacts(username)
+            
+            if contacts_result.get("status") != "success":
+                return contacts_result
+            
+            contacts = contacts_result.get("contacts", [])
+            
+            for contact in contacts:
+                if contact.get("label", "").lower() == contact_name.lower():
+                    account_id = contact.get('account_id') or contact.get('account_num')
+                    return {
+                        "status": "success",
+                        "contact_details": f"Details for {contact_name}: Account number is {account_id}.",
+                        "contact": contact
+                    }
+            
+            return {
+                "status": "error",
+                "error_message": f"Contact '{contact_name}' not found"
+            }
+            
+        except Exception as e:
+            logger.error(f"Get contact by name error: {e}")
+            return {"status": "error", "error_message": "Unable to retrieve contact"}
+
+# ai-services/contact-sage/config.py
+"""
+Configuration for Contact-Sage service
+"""
+
+import os
+import base64
+
+class ContactSageConfig:
+    """Configuration for Contact-Sage"""
+    
+    def __init__(self):
+        # Core service addresses
+        self.contacts_api_addr = os.getenv('CONTACTS_API_ADDR', 'contacts:8080')
+        
+        # Authentication
+        self.jwt_public_key = self._load_public_key()
+        
+        # Service settings
+        self.backend_timeout = int(os.getenv('BACKEND_TIMEOUT', '10'))
+        
+    def _load_public_key(self) -> str:
+        """Load JWT public key"""
+        try:
+            public_key_path = "/tmp/.ssh/publickey"
+            if os.path.exists(public_key_path):
+                with open(public_key_path, 'r') as f:
+                    return f.read()
+            
+            public_key_b64 = os.getenv('JWT_PUBLIC_KEY')
+            if public_key_b64:
+                return base64.b64decode(public_key_b64).decode('utf-8')
+                
+            return None
+        except Exception as e:
+            print(f"Error loading public key: {e}")
+            return None
